@@ -28,3 +28,24 @@ export {
   writeAuditRecord,
   writeShiftSummary,
 } from "./postgres/index.js";
+
+// DynaClone — read-only MySQL replica of DynamoDB (joins, aggregations)
+export {
+  DynaCloneClient,
+  type DynaCloneConnectionConfig,
+  type SecretsLookupFn,
+  getActiveDriversOnShift,
+  getAvailableOnCallDrivers,
+  getPredictedDriverCount,
+  getOrderSubtotal,
+  getDriverDeliveryStats,
+  type ActiveDriverOnShift,
+  type OnCallDriver,
+  type PredictedDriverCount,
+  type OrderSubtotalRow,
+  type DriverDeliveryStats,
+  fixDynacloneArrays,
+  parseIntField,
+  parseBoolField,
+  epochToDate,
+} from "./dynaclone/index.js";

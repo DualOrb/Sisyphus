@@ -47,6 +47,8 @@ import { driverUnresponsiveScenario } from "./driver-unresponsive.js";
 import { ticketFloodScenario } from "./ticket-flood.js";
 import { marketSurgeScenario } from "./market-surge.js";
 import { happyPathScenario } from "./happy-path.js";
+import { lateDeliveryChainScenario } from "./late-delivery-chain.js";
+import { shiftTransitionScenario } from "./shift-transition.js";
 
 export const ALL_SCENARIOS: Scenario[] = [
   unassignedOrdersScenario,
@@ -54,4 +56,6 @@ export const ALL_SCENARIOS: Scenario[] = [
   ticketFloodScenario,
   marketSurgeScenario,
   happyPathScenario,
+  lateDeliveryChainScenario,
+  shiftTransitionScenario,
 ];

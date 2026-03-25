@@ -24,6 +24,17 @@ export {
 // API executor
 export { DispatchApiWriter, type ApiWriteResult, ApiExecutor } from "./api/index.js";
 
+// WebSocket — real-time dispatch connection
+export {
+  DispatchWebSocket,
+  SisyphusPresence,
+  MessageListener,
+  type PresenceUser,
+  type DriverMessage,
+  type PresenceUpdatePayload,
+  type QueuedMessage,
+} from "./websocket/index.js";
+
 // Shadow executor
 export {
   ShadowExecutor,

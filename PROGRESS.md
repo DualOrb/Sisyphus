@@ -144,9 +144,41 @@ Live dispatch integration (API sync, Playwright selectors) deferred until dispat
   - Happy Path (5 actions) — routine operations, guardrails reject invalid actions
 - [x] Runnable via `tsx scripts/simulate.ts` with --verbose and --only flags
 
-### Remaining Phase 2 Work
-- [ ] Process file refinement based on simulation/shadow results
-- [ ] Shadow shift report generator (formatted HTML/markdown summary of proposals)
+### Shift Report Generator (Complete)
+- [x] `generateShiftReport()` — assembles report from shift stats, proposals, metrics, audit records, token usage
+- [x] Markdown formatter — professional report with tables, collapsible details, recommendations
+- [x] JSON formatter — for programmatic consumption
+- [x] Sample report generator script (`tsx scripts/generate-report.ts`)
+- [x] Auto-generated recommendations (low driver coverage, high error rates, escalation patterns)
+
+### WebSocket Integration (Complete)
+- [x] `DispatchWebSocket` — connects to dispatch WS, auto-reconnect with exponential backoff, 60s keepalive ping
+- [x] `SisyphusPresence` — broadcasts what Sisyphus is doing (route, viewMode, activity) to other dispatchers
+- [x] `MessageListener` — queues incoming driver messages (bounded queue, max 100) for agent processing
+- [x] 21 WebSocket unit tests passing
+
+### DynaClone MySQL Client (Complete)
+- [x] `DynaCloneClient` — MySQL connection pool (max 5), credentials from Secrets Manager or config
+- [x] 5 pre-built dispatch queries (active drivers on shift, on-call availability, predicted driver count, order subtotal, delivery stats)
+- [x] Data utilities: `fixDynacloneArrays`, `parseIntField`, `parseBoolField`, `epochToDate`
+- [x] 40 DynaClone utility tests passing
+
+### Additional Process Files (Complete — 20 total)
+- [x] customer-support/late-delivery.md — cause identification, refund by delay severity
+- [x] customer-support/missing-items.md — item-level investigation and partial refund
+- [x] customer-support/wrong-order.md — always full refund, restaurant flagging
+- [x] market-monitor/staffing-alerts.md — driver gap detection, shift forecasting
+- [x] driver-comms/driver-issues.md — app problems, navigation, restaurant closed, customer unreachable
+- [x] task-executor/menu-management.md — toggle availability, price updates, bulk ops
+- [x] task-executor/admin-tasks.md — zone updates, market settings, data corrections
+
+### Additional Scenarios (Complete — 7 total, 40 actions)
+- [x] Late Delivery Chain (6 actions) — investigate → document → escalate → resolve → message driver → cooldown
+- [x] Shift Transition (7 actions) — handoff notes, flag unassigned orders, market health, shift summary
+
+### Test Summary
+- 237 unit/integration tests passing (489ms)
+- 7 simulation scenarios, 40 actions, all passing
 
 ## Phase 3: Supervised Dispatch (Not Started)
 - [ ] AMD Halo hardware setup

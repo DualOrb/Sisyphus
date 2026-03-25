@@ -5,3 +5,6 @@ dist/
 .DS_Store
 coverage/
 .turbo/
+reports/
+
+Dispatch Analyst Guide/
