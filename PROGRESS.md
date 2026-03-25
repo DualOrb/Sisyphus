@@ -124,10 +124,29 @@
 All Phase 1 deliverables done. System is architecturally complete and tested in isolation.
 Live dispatch integration (API sync, Playwright selectors) deferred until dispatch-new is stable.
 
-## Phase 2: Shadow Mode (Not Started)
-- [ ] Full shadow shift — agents propose actions, logged but not executed
-- [ ] Proposal accuracy tracking vs human dispatcher
-- [ ] Process file refinement based on shadow results
+## Phase 2: Shadow Mode
+
+### Shadow Executor & Proposal System (Complete)
+- [x] `ShadowExecutor` — replaces real browser/API execution, logs proposals instead
+- [x] `ProposalStore` — PostgreSQL persistence for proposals with Drizzle schema (`shadow_proposals` table)
+- [x] `ShadowMetrics` — per-shift tracking: total proposals, by action/tier/agent/validation, accuracy reports
+- [x] Operating mode system (`OPERATING_MODE` env: shadow/supervised/autonomous)
+- [x] ExecutionRouter shadow interception — all actions route through shadow executor when in shadow mode
+- [x] `markReviewed()` — human can agree/disagree with proposals for accuracy tracking
+- [x] 21 shadow mode unit tests passing
+
+### Simulation Harness (Complete)
+- [x] 5 dispatch scenarios (27 actions total, all passing):
+  - Unassigned Orders Piling Up (6 actions) — resource scarcity, cooldowns, paused/offline driver rejection
+  - Driver Unresponsive Mid-Delivery (5 actions) — follow-up protocol, cooldown, reassignment
+  - Ticket Flood (6 actions) — triage prioritization, tier routing (GREEN auto, ORANGE/RED staged)
+  - Market Surge (5 actions) — health detection, flagging, cross-zone awareness
+  - Happy Path (5 actions) — routine operations, guardrails reject invalid actions
+- [x] Runnable via `tsx scripts/simulate.ts` with --verbose and --only flags
+
+### Remaining Phase 2 Work
+- [ ] Process file refinement based on simulation/shadow results
+- [ ] Shadow shift report generator (formatted HTML/markdown summary of proposals)
 
 ## Phase 3: Supervised Dispatch (Not Started)
 - [ ] AMD Halo hardware setup

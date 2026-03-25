@@ -19,7 +19,7 @@ export interface ExecutionResult {
   /** Whether the action completed successfully. */
   success: boolean;
   /** Which executor handled the action. */
-  method: "browser" | "api" | "internal";
+  method: "browser" | "api" | "internal" | "shadow";
   /** Wall-clock duration in milliseconds. */
   duration: number;
   /** Human-readable error message when success is false. */

@@ -94,3 +94,35 @@ export const entityInteractions = pgTable(
 
 export type EntityInteractionRecord = typeof entityInteractions.$inferInsert;
 export type EntityInteractionRow = typeof entityInteractions.$inferSelect;
+
+// ---------------------------------------------------------------------------
+// shadow_proposals — proposals recorded in shadow mode for human review
+// ---------------------------------------------------------------------------
+
+export const shadowProposals = pgTable(
+  "shadow_proposals",
+  {
+    id: uuid("id").primaryKey().defaultRandom(),
+    shiftDate: date("shift_date").notNull(),
+    timestamp: timestamp("timestamp", { withTimezone: true }).notNull().defaultNow(),
+    actionName: text("action_name").notNull(),
+    params: jsonb("params"),
+    tier: text("tier").notNull(),
+    wouldExecuteVia: text("would_execute_via").notNull(),
+    reasoning: text("reasoning"),
+    agentId: text("agent_id"),
+    validationPassed: boolean("validation_passed"),
+    validationErrors: jsonb("validation_errors"),
+    humanDecision: text("human_decision"),
+    humanNote: text("human_note"),
+    reviewedAt: timestamp("reviewed_at", { withTimezone: true }),
+  },
+  (table) => [
+    index("idx_shadow_proposals_shift").on(table.shiftDate, table.timestamp),
+    index("idx_shadow_proposals_action").on(table.actionName, table.timestamp),
+    index("idx_shadow_proposals_review").on(table.humanDecision, table.shiftDate),
+  ],
+);
+
+export type ShadowProposalRecord = typeof shadowProposals.$inferInsert;
+export type ShadowProposalRow = typeof shadowProposals.$inferSelect;

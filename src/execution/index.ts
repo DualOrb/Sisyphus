@@ -23,3 +23,16 @@ export {
 
 // API executor
 export { DispatchApiWriter, type ApiWriteResult, ApiExecutor } from "./api/index.js";
+
+// Shadow executor
+export {
+  ShadowExecutor,
+  type Proposal,
+  type OnProposalCallback,
+  ProposalStore,
+  type ProposalStats,
+  ShadowMetrics,
+  type ShadowSummary,
+  type AccuracyReport,
+  type ReviewedProposal,
+} from "./shadow/index.js";

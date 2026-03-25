@@ -46,6 +46,9 @@ const envSchema = z.object({
   LANGSMITH_API_KEY: z.string().optional(),
   LANGSMITH_PROJECT: z.string().default("sisyphus"),
 
+  // Operating mode
+  OPERATING_MODE: z.enum(["shadow", "supervised", "autonomous"]).default("shadow"),
+
   NODE_ENV: z.enum(["development", "production", "test"]).default("development"),
 });
 
