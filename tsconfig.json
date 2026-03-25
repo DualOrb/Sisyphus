@@ -26,6 +26,7 @@
       "@llm/*": ["./src/llm/*"],
       "@tools/*": ["./src/tools/*"],
       "@lib/*": ["./src/lib/*"],
+      "@events/*": ["./src/events/*"],
       "@db/*": ["./db/*"]
     }
   },

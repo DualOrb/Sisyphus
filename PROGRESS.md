@@ -176,9 +176,33 @@ Live dispatch integration (API sync, Playwright selectors) deferred until dispat
 - [x] Late Delivery Chain (6 actions) — investigate → document → escalate → resolve → message driver → cooldown
 - [x] Shift Transition (7 actions) — handoff notes, flag unassigned orders, market health, shift summary
 
+### Event Processing Pipeline (Complete)
+- [x] `EventDetector` — scans ontology for actionable situations (unassigned orders, market alerts, driver offline, new tickets, status changes)
+- [x] `EventQueue` — priority queue (critical > high > normal > low), bounded at 500 events, FIFO within priority
+- [x] `EventDispatcher` — formats events into natural language for the supervisor agent
+- [x] `DispatchCycle` — full cycle: collect messages → detect events → queue → format → invoke graph
+- [x] 32 event system tests passing
+
+### Health & Monitoring (Complete)
+- [x] Health checks for Redis, PostgreSQL, OntologyStore, LLM, Chrome, Temporal worker
+- [x] HTTP health endpoint (GET /health, /health/ready, /health/live, /status)
+- [x] Docker HEALTHCHECK directive added to Dockerfile
+- [x] `aggregateHealth()` — critical component failure = unhealthy, non-critical = degraded
+- [x] 19 health check tests passing
+
+### Developer CLI Tools (Complete)
+- [x] `tsx scripts/inspect-store.ts` — inspect ontology state with fake data (--orders, --drivers, --markets flags)
+- [x] `tsx scripts/inspect-actions.ts` — formatted table of all 11 registered actions with tiers, cooldowns, criteria
+- [x] `tsx scripts/test-action.ts <ActionName> '{params}'` — test single action through full guardrails pipeline
+- [x] `tsx scripts/validate-processes.ts` — validate all 20 process files (frontmatter, agent names, priorities)
+- [x] `ProcessWatcher` — hot-reload process .md files on change with 500ms debounce
+- [x] 9 process watcher tests passing
+
 ### Test Summary
-- 237 unit/integration tests passing (489ms)
+- 297 unit/integration tests passing (477ms)
 - 7 simulation scenarios, 40 actions, all passing
+- 20 process files validated
+- 5 CLI tools working
 
 ## Phase 3: Supervised Dispatch (Not Started)
 - [ ] AMD Halo hardware setup
