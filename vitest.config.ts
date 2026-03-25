@@ -25,6 +25,7 @@ export default defineConfig({
       "@llm": resolve(__dirname, "src/llm"),
       "@tools": resolve(__dirname, "src/tools"),
       "@lib": resolve(__dirname, "src/lib"),
+      "@adapters": resolve(__dirname, "src/adapters"),
       "@events": resolve(__dirname, "src/events"),
     },
   },

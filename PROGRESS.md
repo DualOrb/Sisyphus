@@ -204,6 +204,28 @@ Live dispatch integration (API sync, Playwright selectors) deferred until dispat
 - 20 process files validated
 - 5 CLI tools working
 
+### Dispatch Adapter Layer (Complete)
+- [x] `DispatchAdapter` interface — unified API for both old and new dispatch systems
+- [x] `OldDispatchClient` — calls `/post/*.php` endpoints with session cookie (form-encoded POST)
+- [x] `NewDispatchClient` — wraps existing DispatchApiClient/Writer for new dispatch
+- [x] Old dispatch auth — Cognito redirect flow via Playwright + session cookie extraction
+- [x] Adapter factory — `DISPATCH_ADAPTER` env var selects old-dispatch (default) or new-dispatch
+- [x] `OntologySyncSource` interface — syncer works with either adapter without breaking changes
+- [x] Old dispatch response transformers:
+  - DynamoDB wire format unwrapper ({S:}, {N:}, {BOOL:} → plain values)
+  - PHP value normalizer ("true"/"false"/"null" strings)
+  - `parseDispatchCache` — splits builddispatchcache.php blob into typed arrays
+  - `parseIssueRows` — extracts structured data from HTML via data-* attributes
+  - `parseOrderDetails`/`parseDriverDetails` — unwrap DynamoDB responses
+- [x] Old dispatch discovery doc (planning/12-old-dispatch-discovery.md)
+- [x] 91 adapter tests passing (31 client + 60 transformer)
+
+### Test Summary
+- 388 unit/integration tests passing (579ms)
+- 7 simulation scenarios, 40 actions, all passing
+- 20 process files validated
+- 5 CLI tools working
+
 ## Phase 3: Supervised Dispatch (Not Started)
 - [ ] AMD Halo hardware setup
 - [ ] Autonomy tier activation (GREEN/YELLOW auto-execute)

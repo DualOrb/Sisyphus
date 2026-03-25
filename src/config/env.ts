@@ -15,6 +15,7 @@ const envSchema = z.object({
   DISPATCH_WS_URL: z.string().url(),
   DISPATCH_USERNAME: z.string().min(1),
   DISPATCH_PASSWORD: z.string().min(1),
+  DISPATCH_ADAPTER: z.enum(["old-dispatch", "new-dispatch"]).default("old-dispatch"),
 
   // AWS
   AWS_REGION: z.string().default("us-east-1"),

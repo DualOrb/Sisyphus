@@ -12,6 +12,7 @@
 import type { Logger } from "../../lib/logger.js";
 import type { DispatchApiClient } from "./dispatch-api.js";
 import type { OntologyStore } from "../state/store.js";
+import type { OntologySyncSource } from "../../adapters/types.js";
 
 import {
   transformOrder,
@@ -33,10 +34,47 @@ export class OntologySyncer {
   private intervalHandle: ReturnType<typeof setInterval> | null = null;
   private _isSyncing = false;
 
+  /**
+   * Optional adapter-based data source. When set, the syncer uses this
+   * instead of the `DispatchApiClient` for fetching data — enabling it
+   * to work with either the old or new dispatch system transparently.
+   */
+  private adapterSource: OntologySyncSource | null = null;
+
   constructor(api: DispatchApiClient, store: OntologyStore, logger: Logger) {
     this.api = api;
     this.store = store;
     this.log = logger;
+  }
+
+  /**
+   * Create a syncer that uses a `DispatchAdapter` (or any `OntologySyncSource`)
+   * instead of the direct `DispatchApiClient`.
+   *
+   * This factory method allows the syncer to work with the adapter layer
+   * without breaking any existing code that passes a `DispatchApiClient`.
+   */
+  static fromAdapter(
+    adapter: OntologySyncSource,
+    store: OntologyStore,
+    logger: Logger,
+  ): OntologySyncer {
+    // We need a DispatchApiClient for the constructor, but the adapter
+    // will override all fetch calls. Create a dummy client that the
+    // adapterSource will shadow.
+    const dummyApi = {
+      fetchOrders: () => Promise.resolve([]),
+      fetchDrivers: () => Promise.resolve([]),
+      fetchIssues: () => Promise.resolve([]),
+      fetchConversations: () => Promise.resolve([]),
+      fetchDispatchSnapshot: () => Promise.resolve(null),
+      fetchMarketMeters: () => Promise.resolve([]),
+    } as unknown as DispatchApiClient;
+
+    const syncer = new OntologySyncer(dummyApi, store, logger);
+    syncer.adapterSource = adapter;
+    logger.info("OntologySyncer created with adapter source");
+    return syncer;
   }
 
   // ---- Public API -----------------------------------------------------------
@@ -65,7 +103,11 @@ export class OntologySyncer {
     const startMs = Date.now();
 
     try {
-      // Parallel fetch — each wrapped in its own error boundary
+      // Parallel fetch — each wrapped in its own error boundary.
+      // When an adapterSource is set (via `fromAdapter`), use it instead of
+      // the direct DispatchApiClient. This lets the syncer work with any
+      // dispatch backend through the adapter layer.
+      const src = this.adapterSource;
       const [
         rawOrders,
         rawDrivers,
@@ -74,12 +116,30 @@ export class OntologySyncer {
         rawSnapshot,
         rawMeters,
       ] = await Promise.all([
-        this.safeFetch("orders", () => this.api.fetchOrders()),
-        this.safeFetch("drivers", () => this.api.fetchDrivers()),
-        this.safeFetch("issues", () => this.api.fetchIssues()),
-        this.safeFetch("conversations", () => this.api.fetchConversations()),
-        this.safeFetch("snapshot", () => this.api.fetchDispatchSnapshot()),
-        this.safeFetch("meters", () => this.api.fetchMarketMeters()),
+        this.safeFetch("orders", () =>
+          src ? src.fetchOrders() : this.api.fetchOrders(),
+        ),
+        this.safeFetch("drivers", () =>
+          src ? src.fetchDrivers() : this.api.fetchDrivers(),
+        ),
+        this.safeFetch("issues", () =>
+          src ? src.fetchIssues() : this.api.fetchIssues(),
+        ),
+        this.safeFetch("conversations", () =>
+          src?.fetchConversations
+            ? src.fetchConversations()
+            : this.api.fetchConversations(),
+        ),
+        this.safeFetch("snapshot", () =>
+          src?.fetchDispatchSnapshot
+            ? src.fetchDispatchSnapshot()
+            : this.api.fetchDispatchSnapshot(),
+        ),
+        this.safeFetch("meters", () =>
+          src?.fetchMarketMeters
+            ? src.fetchMarketMeters()
+            : this.api.fetchMarketMeters(),
+        ),
       ]);
 
       // -- Transform orders --
