@@ -164,6 +164,29 @@ export function createMockRedis() {
       return (sortedSets.get(key) ?? []).length;
     },
 
+    async zcount(key: string, min: number | string, max: number | string): Promise<number> {
+      const set = sortedSets.get(key) ?? [];
+      const minScore = min === "-inf" ? -Infinity : Number(min);
+      const maxScore = max === "+inf" ? Infinity : Number(max);
+      return set.filter((m) => m.score >= minScore && m.score <= maxScore).length;
+    },
+
+    async zrange(key: string, start: number, stop: number): Promise<string[]> {
+      const set = sortedSets.get(key) ?? [];
+      const end = stop === -1 ? set.length : stop + 1;
+      return set.slice(start, end).map((m) => m.member);
+    },
+
+    // ---- List commands ----
+
+    async lpush(key: string, ...values: string[]): Promise<number> {
+      const entry = store.get(key);
+      const list: string[] = entry ? JSON.parse(entry.value) : [];
+      list.unshift(...values);
+      store.set(key, { value: JSON.stringify(list) });
+      return list.length;
+    },
+
     // ---- Lua eval (minimal implementation for lock scripts) ----
 
     async eval(script: string, numKeys: number, ...args: any[]): Promise<unknown> {
