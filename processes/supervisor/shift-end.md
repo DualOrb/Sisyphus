@@ -3,120 +3,105 @@ agent: supervisor
 trigger: shift_end
 priority: critical
 version: "1.0"
+source: "Dispatch Analyst Guide — End of Shift Routine"
+supplements: shift-end.md
 ---
 
-# Process: Shift End & Handoff
+# End-of-Shift Checklist (Dispatch Analyst Guide Procedures)
 
-## Trigger
+This document captures the actual end-of-shift routine as defined in the Dispatch Analyst Guide. It supplements `shift-end.md` (which covers Sisyphus system-level shutdown) with the real-world human dispatcher procedures that Sisyphus must replicate or verify.
 
-When the current operating shift is ending — either at the scheduled end time or when a human dispatcher signals takeover.
+---
 
-## Prerequisites
+## Purpose
 
-Before beginning shutdown:
-- [ ] `query_orders({ status: ["Pending", "Confirmed", "Ready"] })` — check for in-progress orders
-- [ ] `query_tickets({ status: ["New", "Pending"] })` — check for open tickets
-- [ ] Confirm no sub-agent is mid-task (check `active_tasks` in shared state)
+Ensure a smooth transition between your shift and the next dispatcher coming on. Nothing should fall through the cracks.
 
-## Shutdown Sequence
+---
 
-### Step 1: Complete or Hand Off In-Progress Tasks
+## Step 1: Go Offline in Ticket Tracker
 
-For each active task:
+Set yourself to "Offline" in the Ticket Tracker and log out. This ensures:
 
-**If completable within 5 minutes:**
-- Finish the task (send final message, close ticket, resolve alert)
-- Log the resolution normally
+- No calls will be routed to you while you are off shift
+- You are not holding up the support queue
 
-**If not completable within 5 minutes:**
-- Add a handoff note to the task: `execute_action("AddTicketNote", { note: "SHIFT HANDOFF: [current state, what's been done, what remains]" })`
-- Flag the item for the next shift
+**Sisyphus equivalent:** Deregister from the escalation routing system so no new tickets are assigned.
 
-Do NOT start any new non-urgent work during shift-end procedures.
+---
 
-### Step 2: Generate Shift Summary
+## Step 2: Complete or Reassign Outstanding Tickets
 
-Compile statistics from the shift's audit trail:
+For each open ticket assigned to you:
 
-**Actions Taken:**
-- Total ontology actions executed
-- Breakdown by type (messages sent, tickets resolved, orders reassigned, etc.)
-- Actions that were blocked by cooldowns or tier restrictions
+**If completable now:** Resolve it before ending your shift.
 
-**Issues Resolved:**
-- Tickets closed (with resolution categories)
-- Driver communication issues resolved
-- Market health alerts handled
+**If not completable now:**
+1. Assign the ticket to the next available support person on shift
+2. Include all relevant information so they can continue working on the issue
+3. Notify the customer that we will reach out to them when we can regarding their issue
 
-**Escalations:**
-- Total escalations to human dispatchers
-- Breakdown by category (safety, financial, legal, system, authority)
-- Which escalations were resolved vs. still pending
+Do not leave orphaned tickets with no assignee.
 
-**Market Performance:**
-- Per-zone health scores at shift start vs. shift end
-- Average `MarketMeters.Score` across markets during the shift
-- Peak driver gap observed (from `MarketMeters.idealDrivers - MarketMeters.drivers`)
-- Average market ETA from `Alerts.Eta` values
+**Sisyphus equivalent:** Step 1 of `shift-end.md` — Complete or Hand Off In-Progress Tasks. Add handoff notes via `execute_action("AddTicketNote")` for anything that cannot be finished.
 
-**Driver Stats:**
-- Total driver messages sent and received
-- Unresponsive drivers (3+ unanswered follow-ups)
-- Reassignments performed
+---
 
-### Step 3: Flag Unresolved Items
+## Step 3: Send Goodnight Messages to Couriers
 
-Create a clear list for the next shift:
+Send a goodnight text to all your couriers. These messages should:
 
-- [ ] `query_tickets({ status: ["New", "Pending"] })` — open tickets with context notes
-- [ ] `query_orders({ status: "Pending" })` — any still-unassigned orders
-- [ ] Check for drivers marked as unresponsive during this shift
-- [ ] Note any ongoing system issues (degraded connections, recurring failures)
-- [ ] Flag markets with `MarketMeters.Score > 80` that may need attention
+- Always be positive
+- Let them know their work is appreciated
 
-For each unresolved item, include:
-- Entity ID (`IssueId`, `OrderId`, `DriverId`)
-- Brief description of the situation
-- What was already attempted
-- Recommended next step
+This maintains the relationship with couriers and ends the shift on a good note.
 
-### Step 4: Log Shift End
+**Sisyphus equivalent:** Automated end-of-shift thank-you message to all couriers who were active during the shift.
 
-Record the shift end in the audit trail:
-- [ ] `execute_action("LogShiftEvent", { event: "shift_end", operator: "sisyphus", timestamp: now })`
+---
 
-The shift summary payload should include:
+## Step 4: Shift Handoff Meeting
 
-```
-{
-  shift_start: <timestamp>,
-  shift_end: <timestamp>,
-  duration_minutes: N,
-  actions_total: N,
-  tickets_resolved: N,
-  tickets_open: N,
-  escalations_total: N,
-  escalations_pending: N,
-  messages_sent: N,
-  reassignments: N,
-  market_health_avg: N,
-  unresolved_items: [ { entity_id, type, summary, next_step } ],
-  notes: "Free-text notes about anything unusual"
-}
-```
+Meet with the person swapping off with you (the incoming dispatcher) and pass on:
 
-Store this in the `ValleyEats-SisyphusShiftSummary` table (or PostgreSQL equivalent):
-- PK: `ShiftDate` (ISO date)
-- SK: `ShiftId` (unique identifier)
+- Any relevant and important information
+- Current state of each market (delays, driver coverage, problem restaurants)
+- Ongoing issues that need monitoring
+- Anything that will help ensure success for the next shift
 
-### Step 5: Graceful Shutdown
+**Sisyphus equivalent:** Steps 2-3 of `shift-end.md` — Generate Shift Summary and Flag Unresolved Items. The shift summary artifact stored in `ValleyEats-SisyphusShiftSummary` serves as the handoff document.
 
-1. Stop the Market Monitor polling loop
-2. Stop the supervisor triage loop
-3. Allow any in-flight ontology actions to complete (wait up to 30 seconds)
-4. Release all Redis locks held by Sisyphus agents
-5. Log final confirmation: shift ended cleanly
+---
 
-## Logging
+## Step 5: Clock Out
 
-The shift end event and full summary are logged via `execute_action("LogShiftEvent")` in Step 4. This record is the primary handoff artifact for the next shift (human or AI).
+Clock out the same way you clocked in (via the clock icon on the dispatch screen).
+
+If you forget to clock in, clock out, or clock in/out for your break, notify your manager (Melissa) to correct it.
+
+**Sisyphus equivalent:** `execute_action("LogShiftEvent", { event: "shift_end" })`.
+
+---
+
+## Step 6: Secure the Office
+
+Follow any end-of-shift routines given by your manager for:
+
+- Leaving the office
+- Locking up
+- Following proper protocols
+
+**Sisyphus equivalent:** Step 5 of `shift-end.md` — Graceful Shutdown (stop polling loops, release Redis locks, log final confirmation).
+
+---
+
+## Quick Reference Checklist
+
+- [ ] Set yourself to "Offline" in Ticket Tracker and log out
+- [ ] Complete any outstanding tickets you can finish now
+- [ ] Reassign remaining tickets to the next support person — include full context
+- [ ] Notify affected customers that we will follow up
+- [ ] Send a positive goodnight message to all your couriers
+- [ ] Meet with the incoming dispatcher — hand off all relevant info
+- [ ] Clock out on the dispatch screen
+- [ ] Follow office closing procedures (lock up, etc.)

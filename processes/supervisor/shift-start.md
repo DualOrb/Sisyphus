@@ -3,104 +3,109 @@ agent: supervisor
 trigger: shift_start
 priority: critical
 version: "1.0"
+source: "Dispatch Analyst Guide — Start Of Shift Routine"
+supplements: shift-start.md
 ---
 
-# Process: Shift Start Procedures
+# Start-of-Shift Checklist (Dispatch Analyst Guide Procedures)
 
-## Trigger
+This document captures the actual start-of-shift routine as defined in the Dispatch Analyst Guide. It supplements `shift-start.md` (which covers Sisyphus system-level startup) with the real-world human dispatcher procedures that Sisyphus must replicate or verify.
 
-When Sisyphus begins a new operating shift. This runs once at the beginning of each shift before any other agent activity begins.
+---
 
-## Prerequisites
+## Step 1: Log In to Dispatch Webpage
 
-None — this is the first process that runs. It establishes the prerequisites for everything else.
+Open the dispatch webpage and confirm the UI is loaded. All market tabs, order tables, and map views must be accessible.
 
-## Startup Sequence
+**Sisyphus equivalent:** Step 1 of `shift-start.md` — Verify System Connections (browser session, DynamoDB, Redis, PostgreSQL).
 
-### Step 1: Verify System Connections
+---
 
-Check each dependency in order. If any critical connection fails, do not proceed — escalate immediately.
+## Step 2: Sign In to Call Center
 
-| System | Check Method | Critical? |
-|--------|-------------|-----------|
-| Chrome/Browser Executor | Verify browser session is active and dispatch UI is loaded | Yes |
-| Redis | Ping Redis — confirm connection for locks and cooldowns | Yes |
-| PostgreSQL | Test query against Sisyphus audit tables | Yes |
-| DynamoDB | `query_orders({ status: "Pending", limit: 1 })` — confirm read access | Yes |
-| S3 Dispatch Snapshots | Verify latest snapshot is < 2 minutes old | No (warn) |
-| DynaClone (MySQL) | Test connection to `iris.valleyeats.ca` | No (warn) |
+Sign into the call center even if you are not working a support shift. This is required to:
 
-If a critical connection fails:
-1. Log the failure: `execute_action("LogShiftEvent", { event: "shift_start_failed", reason: "..." })`
-2. Call `request_clarification({ urgency: "critical", category: "system_anomaly" })`
-3. Do not proceed until the connection is restored
+- Track metrics accurately
+- Be ready if a call needs to be transferred to you
 
-If a non-critical connection fails:
-1. Log a warning and continue
-2. Note the degraded capability for the shift
+**Sisyphus equivalent:** Ensure the support/ticket subsystem is accessible and the agent is registered as available for escalation routing.
 
-### Step 2: Load Previous Shift Handoff
+---
 
-Query the most recent shift summary:
-- [ ] `query_shift_summaries({ limit: 1, sort: "desc" })` — get last shift's handoff notes
+## Step 3: Clock In and Claim Markets
 
-Review the handoff for:
-- Unresolved issues flagged for this shift
-- Drivers marked as unresponsive who may still be on duty
-- Ongoing situations requiring follow-up (e.g., restaurant outage, recurring customer complaint)
-- Any special instructions left by the previous shift operator
+On the Settings page:
 
-### Step 3: Check Unresolved Issues
+1. Clock in using the clock icon at the top center of the dispatch screen
+2. Click the checkboxes for your assigned markets to "claim" them
+3. Click "Select a Queue" and choose your name
 
-Scan for items that carried over:
-- [ ] `query_tickets({ status: ["New", "Pending"] })` — open support tickets
-- [ ] `query_orders({ status: "Pending" })` — unassigned orders (should be 0 at shift start; if not, immediate attention)
-- [ ] `query_orders({ status: ["Confirmed", "Ready"] })` — orders in progress without driver movement
+This tells the system which markets you are responsible for and starts your shift timer.
 
-For each unresolved item:
-1. Check its age — if older than 30 minutes, prioritize it
-2. Determine which sub-agent should handle it
-3. Add to the initial task queue
+**Sisyphus equivalent:** `execute_action("LogShiftEvent", { event: "shift_start" })` and activate market monitors for assigned zones.
 
-### Step 4: Verify Market Health
+---
 
-Poll all active markets:
-- [ ] `query_market_health({})` — get `MarketMeters` for all zones
+## Step 4: Record Courier Information
 
-For each market, check:
-- `MarketMeters.Score` — if > 80, flag as needing attention (100 = critical need)
-- `MarketMeters.drivers` vs `MarketMeters.idealDrivers` — driver gap
-- `Alerts.Eta` — current ETA per market (query `Alerts` table, key: `{Market}Eta`)
+After claiming your markets, record all couriers in each market in your notebook:
 
-Log a shift-start market snapshot for comparison throughout the shift.
+- Courier name / moniker (2-character identifier)
+- Shift start time
+- Shift end time
 
-### Step 5: Verify Driver Coverage
+This helps you organize your couriers throughout the shift and track when they are leaving.
 
-Check scheduled drivers for this shift:
-- [ ] Query `DriverShifts` via DynaClone: drivers with `shiftstart <= now AND shiftend >= now` per market
-- [ ] `query_drivers({ isAvailable: true })` — currently online drivers
+**Sisyphus equivalent:** Query `DriverShifts` via DynaClone and build the in-memory courier roster with shift windows for each market.
 
-Compare scheduled vs. actually online. If the gap is significant (>30% of scheduled drivers not online), note it as a monitoring priority.
+---
 
-### Step 6: Log Shift Start
+## Step 5: Message All Couriers
 
-Record the shift start in the audit trail:
-- [ ] `execute_action("LogShiftEvent", { event: "shift_start", operator: "sisyphus", timestamp: now, market_snapshot: {...}, unresolved_count: N, system_status: "all_green" | "degraded" })`
+Send a hello message to all your couriers. Let them know:
 
-Include in the log:
-- All system connection statuses
-- Count of unresolved items from previous shift
-- Market health summary (per-zone scores)
-- Driver coverage summary
-- Any warnings or degraded capabilities
+- You are on shift
+- You are available if they need anything
 
-## Post-Startup
+This establishes communication and confirms couriers are responsive.
 
-Once all steps complete:
-1. Activate the Market Monitor agent on its polling loop
-2. Begin the supervisor's main triage loop (see `triage-priority.md`)
-3. Process any unresolved items identified in Step 3, highest priority first
+**Sisyphus equivalent:** Automated shift-start greeting via the messaging system to all active couriers in claimed markets.
 
-## Logging
+---
 
-The shift start event is logged via `execute_action("LogShiftEvent")` in Step 6. All subsequent actions during the shift are logged automatically by the ontology action layer.
+## Step 6: Check Outstanding Tickets
+
+Open the Ticket Tracker and select your name to check for any tickets assigned to you.
+
+- If tickets exist, you are responsible for their resolution — either resolve them yourself or hand them off to the appropriate department
+- An orange circle with a number will appear at the top if any tickets are assigned to you
+
+**Sisyphus equivalent:** Step 3 of `shift-start.md` — `query_tickets({ status: ["New", "Pending"] })` and prioritize unresolved items.
+
+---
+
+## Step 7: Check Discord Notes and Announcements
+
+Log in to Discord and check:
+
+- Notes for your specific markets (market-specific updates, restaurant closures, known issues)
+- General announcements (company-wide changes, system updates, policy changes)
+
+This ensures you are aware of any conditions that affect dispatching decisions for your shift.
+
+**Sisyphus equivalent:** Step 2 of `shift-start.md` — Load Previous Shift Handoff. Discord notes are the human equivalent of the shift summary / handoff artifact.
+
+---
+
+## Quick Reference Checklist
+
+- [ ] Log in to dispatch webpage
+- [ ] Sign in to call center (even if not on support)
+- [ ] Clock in on the Settings page
+- [ ] Claim your assigned markets (check the boxes)
+- [ ] Select your name in the queue
+- [ ] Record all courier names, start times, and end times for each market
+- [ ] Send a hello message to all couriers
+- [ ] Open Ticket Tracker — check for tickets assigned to you
+- [ ] Resolve or hand off any outstanding tickets
+- [ ] Log in to Discord — read market notes and announcements
