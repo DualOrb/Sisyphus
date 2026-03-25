@@ -111,10 +111,15 @@
 
 ---
 
+### Wiring & Tests (Complete)
+- [x] TypeScript type-check passes clean (0 errors, 112 files)
+- [x] Temporal activity stubs wired to real modules (browser, syncer, graph, postgres)
+- [x] 130 unit tests passing (274ms):
+  - Guardrails: 31 tests (registry, validator, cooldown, rate limiter, circuit breaker)
+  - Ontology: 70 tests (transformers, store queries, schema validation)
+  - Memory: 29 tests (action timeline, locks, heartbeat)
+
 ## Phase 1: Remaining Work
-- [ ] npm install and full type-check pass
-- [ ] Wire Temporal activity stubs to real modules (syncer, graph, browser)
-- [ ] Unit tests (guardrails, ontology transformers, cooldowns, rate limiter)
 - [ ] Integration test against live dispatch API (validate sync layer)
 - [ ] Verify Playwright selectors against real dispatch UI
 - [ ] First end-to-end run: ontology sync → agent query → action proposal
