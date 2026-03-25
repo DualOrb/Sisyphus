@@ -1,0 +1,145 @@
+version: "3.9"
+
+services:
+  sisyphus-app:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+    container_name: sisyphus-app
+    env_file: ../.env
+    depends_on:
+      redis:
+        condition: service_healthy
+      postgres:
+        condition: service_healthy
+      temporal:
+        condition: service_started
+      chrome:
+        condition: service_healthy
+    volumes:
+      - ../processes:/app/processes:ro
+      - ../logs:/app/logs
+    deploy:
+      resources:
+        limits:
+          memory: 4G
+          cpus: "2.0"
+    restart: unless-stopped
+    networks:
+      - sisyphus-net
+
+  temporal:
+    image: temporalio/auto-setup:latest
+    container_name: sisyphus-temporal
+    environment:
+      - DB=postgresql
+      - DB_PORT=5432
+      - POSTGRES_USER=temporal
+      - POSTGRES_PWD=${TEMPORAL_POSTGRES_PASSWORD:-temporal}
+      - POSTGRES_SEEDS=postgres
+    depends_on:
+      postgres:
+        condition: service_healthy
+    ports:
+      - "7233:7233"
+    deploy:
+      resources:
+        limits:
+          memory: 2G
+          cpus: "1.0"
+    restart: unless-stopped
+    networks:
+      - sisyphus-net
+
+  temporal-ui:
+    image: temporalio/ui:latest
+    container_name: sisyphus-temporal-ui
+    environment:
+      - TEMPORAL_ADDRESS=temporal:7233
+    depends_on:
+      - temporal
+    ports:
+      - "8088:8080"
+    deploy:
+      resources:
+        limits:
+          memory: 512M
+    restart: unless-stopped
+    networks:
+      - sisyphus-net
+
+  chrome:
+    image: browserless/chrome:latest
+    container_name: sisyphus-chrome
+    environment:
+      - MAX_CONCURRENT_SESSIONS=2
+      - CONNECTION_TIMEOUT=600000
+    ports:
+      - "9222:3000"
+    deploy:
+      resources:
+        limits:
+          memory: 2G
+          cpus: "2.0"
+    shm_size: "1gb"
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:3000/json/version"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+    restart: unless-stopped
+    networks:
+      - sisyphus-net
+
+  redis:
+    image: redis:7-alpine
+    container_name: sisyphus-redis
+    command: redis-server --maxmemory 512mb --maxmemory-policy allkeys-lru
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis-data:/data
+    deploy:
+      resources:
+        limits:
+          memory: 1G
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+    restart: unless-stopped
+    networks:
+      - sisyphus-net
+
+  postgres:
+    image: postgres:16-alpine
+    container_name: sisyphus-postgres
+    environment:
+      - POSTGRES_USER=sisyphus
+      - POSTGRES_PASSWORD=${POSTGRES_PASSWORD:-sisyphus}
+      - POSTGRES_DB=sisyphus
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    deploy:
+      resources:
+        limits:
+          memory: 2G
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U sisyphus"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+    restart: unless-stopped
+    networks:
+      - sisyphus-net
+
+volumes:
+  redis-data:
+  postgres-data:
+
+networks:
+  sisyphus-net:
+    driver: bridge
