@@ -47,6 +47,7 @@ let lastLlmCall = 0;
 let totalLlmCalls = 0;
 let totalEventsProcessed = 0;
 let cycleCount = 0;
+let latestDispatchData: any = null;
 const startTime = Date.now();
 
 // Two hardcoded restaurant IDs to exclude (from dispatch page code)
@@ -169,47 +170,119 @@ function detectChanges(
 // Format situation for LLM
 // ---------------------------------------------------------------------------
 
-function buildSituationReport(store: OntologyStore, events: PrioritizedEvent[]): string {
-  const stats = store.getStats();
+function formatTime(date: Date | null | undefined): string {
+  if (!date || isNaN(date.getTime())) return "n/a";
+  return date.toLocaleTimeString("en-US", { hour: "numeric", minute: "2-digit", hour12: true, timeZone: "America/Toronto" });
+}
+
+function minutesAgo(date: Date | null | undefined): string {
+  if (!date || isNaN(date.getTime())) return "?";
+  const mins = Math.round((Date.now() - date.getTime()) / 60000);
+  if (mins < 0) return `in ${-mins}m`;
+  if (mins === 0) return "now";
+  return `${mins}m ago`;
+}
+
+function buildSituationReport(
+  store: OntologyStore,
+  dispatchData: any,
+  events: PrioritizedEvent[],
+): string {
   const allOrders = store.queryOrders({});
   const allDrivers = store.queryDrivers({});
-  const allMarkets = Array.from({ length: stats.markets }, (_, i) => {
-    // Get markets from store — iterate known zone names
-    return null;
-  }).filter(Boolean);
+  const zones = Object.keys(dispatchData).filter((k) => k !== "Timestamp");
 
-  const onlineDrivers = allDrivers.filter((d) => d.isOnline);
-  const placedOrders = store.queryOrders({ status: "Placed" });
-  const confirmedOrders = store.queryOrders({ status: "Confirmed" });
-  const readyOrders = store.queryOrders({ status: "Ready" });
-  const inTransitOrders = store.queryOrders({ status: "InTransit" });
-  const unassigned = allOrders.filter((o) => !o.driverId);
-
-  const dispatcher = new EventDispatcher();
-
-  const lines = [
-    `SISYPHUS SHADOW DISPATCH — ${new Date().toISOString()}`,
-    `Mode: SHADOW (analysis only, no real actions)`,
-    ``,
-    `ORDERS: ${allOrders.length} active (Placed: ${placedOrders.length}, Confirmed: ${confirmedOrders.length}, Ready: ${readyOrders.length}, InTransit: ${inTransitOrders.length})`,
-    `  Unassigned: ${unassigned.length}`,
-    `DRIVERS: ${allDrivers.length} in dispatch, ${onlineDrivers.length} on-shift`,
+  const lines: string[] = [
+    `SISYPHUS SHADOW DISPATCH — ${new Date().toLocaleString("en-US", { timeZone: "America/Toronto" })}`,
+    `Mode: SHADOW (analysis only — describe what you WOULD do, do not take actions)`,
     ``,
   ];
 
-  if (events.length > 0) {
-    lines.push(`EVENTS REQUIRING ATTENTION:`);
-    for (const e of events.slice(0, 8)) {
-      lines.push(`  ${dispatcher.formatEventForAgent(e)}`);
+  // ── Per-market breakdown with orders and drivers ──
+  for (const zone of zones) {
+    const zoneData = dispatchData[zone];
+    const zoneOrders = zoneData.Orders ?? [];
+    const zoneDrivers = zoneData.Drivers ?? [];
+    const meter = zoneData.Meter;
+    const onShift = zoneDrivers.filter((d: any) => d.OnShift && !d.Paused);
+    const paused = zoneDrivers.filter((d: any) => d.Paused);
+
+    if (zoneOrders.length === 0 && onShift.length === 0) continue; // skip empty/inactive markets
+
+    lines.push(`── ${zone} (Score: ${meter?.Score ?? "?"}, Drivers: ${onShift.length} on-shift${paused.length ? `, ${paused.length} paused` : ""}) ──`);
+
+    // Drivers in this zone
+    if (zoneDrivers.length > 0) {
+      lines.push(`  Drivers:`);
+      for (const d of zoneDrivers) {
+        const status = d.Paused ? "PAUSED" : d.OnShift ? "ON-SHIFT" : d.Available ? "ON-CALL" : "OFF";
+        const orderCount = zoneOrders.filter((o: any) => o.DriverId === d.DriverId).length;
+        const name = d.Monacher || d.FullName || d.DriverId;
+        const training = d.TrainingOrders > 0 ? ` [TRAINEE: ${d.TrainingOrders} orders left]` : "";
+        const alcohol = d.Alcohol ? " [Smart Serve]" : "";
+        const nearEnd = d.NearEnd ? " [NEAR END]" : "";
+        lines.push(`    ${name} (${status}) — ${orderCount} orders${training}${alcohol}${nearEnd}`);
+      }
     }
-    if (events.length > 8) {
-      lines.push(`  ... and ${events.length - 8} more`);
+
+    // Orders in this zone
+    if (zoneOrders.length > 0) {
+      lines.push(`  Orders:`);
+      for (const o of zoneOrders) {
+        const readyTime = o.OrderReadyTime ? new Date(o.OrderReadyTime * 1000) : null;
+        const readyStr = formatTime(readyTime);
+        const readyAgo = minutesAgo(readyTime);
+        const driverName = zoneDrivers.find((d: any) => d.DriverId === o.DriverId)?.Monacher
+          || zoneDrivers.find((d: any) => d.DriverId === o.DriverId)?.FullName
+          || (o.DriverId ? o.DriverId.split("@")[0] : "UNASSIGNED");
+        const restaurant = o.RestaurantName || "Unknown";
+        const status = o.OrderStatus || "?";
+        const customer = o.DeliveryStreet ? `${o.DeliveryStreet}, ${o.DeliveryCity || ""}` : "no address";
+        const isLate = readyTime && readyTime.getTime() < Date.now() && !["InTransit", "Delivered"].includes(status);
+        const lateFlag = isLate ? " ⚠️ LATE" : "";
+        const unconfirmed = !o.DeliveryConfirmed && status === "Placed" ? " [UNCONFIRMED]" : "";
+        const alcohol = o.Alcohol ? " [ALCOHOL]" : "";
+
+        lines.push(`    ${o.OrderIdKey} | ${status}${lateFlag}${unconfirmed}${alcohol} | ${restaurant} → ${customer} | Driver: ${driverName} | Ready: ${readyStr} (${readyAgo})`);
+      }
     }
-  } else {
-    lines.push(`No urgent events. Routine check — confirm all markets are healthy.`);
+
+    lines.push(``);
   }
 
-  lines.push(``, `What actions would you take? Be specific with IDs and names.`);
+  // ── Markets with no orders but critical scores ──
+  const criticalEmpty = zones.filter((z) => {
+    const zd = dispatchData[z];
+    return (zd.Orders?.length ?? 0) === 0 && (zd.Drivers?.length ?? 0) === 0 && (zd.Meter?.Score ?? 0) >= 80;
+  });
+  if (criticalEmpty.length > 0) {
+    lines.push(`── CRITICAL: No drivers or orders ──`);
+    for (const z of criticalEmpty) {
+      lines.push(`  ${z}: Score ${dispatchData[z].Meter?.Score}, needs ${dispatchData[z].Meter?.idealDrivers} drivers`);
+    }
+    lines.push(``);
+  }
+
+  // ── Summary stats ──
+  lines.push(`── Summary ──`);
+  lines.push(`  Total: ${allOrders.length} orders, ${allDrivers.length} drivers across ${zones.length} markets`);
+  const unassigned = allOrders.filter((o) => !o.driverId);
+  if (unassigned.length > 0) {
+    lines.push(`  ⚠️ ${unassigned.length} orders have no driver assigned`);
+  }
+
+  // ── Events ──
+  if (events.length > 0) {
+    const dispatcher = new EventDispatcher();
+    lines.push(``);
+    lines.push(`── Events ──`);
+    for (const e of events.slice(0, 10)) {
+      lines.push(`  ${dispatcher.formatEventForAgent(e)}`);
+    }
+  }
+
+  lines.push(``);
+  lines.push(`Analyze each market. For orders that are LATE or have issues, describe what action you would take. Be specific — use order IDs, driver names, restaurant names.`);
 
   return lines.join("\n");
 }
@@ -225,6 +298,7 @@ async function pollCycle() {
   try {
     // 1. Fetch dispatch.txt
     const data = await fetchDispatchFile();
+    latestDispatchData = data;
     const { orders, drivers, markets, timestamp } = parseDispatchData(data);
 
     // 2. Save previous state, update current
@@ -276,7 +350,7 @@ async function pollCycle() {
 
       console.log(`\n  \x1b[36m→ Invoking LLM (${hasUrgent ? "URGENT" : isHeartbeat ? "heartbeat" : "changes"})...\x1b[0m`);
 
-      const prompt = buildSituationReport(currentStore, eventsForLlm);
+      const prompt = buildSituationReport(currentStore, latestDispatchData, eventsForLlm);
 
       const response = await callLlm([
         {
