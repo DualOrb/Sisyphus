@@ -19,15 +19,14 @@ import {
   ApplicationFailure,
 } from "@temporalio/workflow";
 
-import type * as activities from "./activities.js";
-import type { ShiftStats } from "./activities.js";
+import type { SisyphusActivities, ShiftStats } from "./activities.js";
 
 // ---------------------------------------------------------------------------
 // Activity proxies with retry/timeout configuration
 // ---------------------------------------------------------------------------
 
 /** Default activities — moderate timeout, 3 retries. */
-const acts = proxyActivities<typeof activities>({
+const acts = proxyActivities<SisyphusActivities>({
   startToCloseTimeout: "60s",
   retry: {
     maximumAttempts: 3,
@@ -38,7 +37,7 @@ const acts = proxyActivities<typeof activities>({
 });
 
 /** Browser activities — longer timeout, more retries for flaky connections. */
-const browserActs = proxyActivities<typeof activities>({
+const browserActs = proxyActivities<SisyphusActivities>({
   startToCloseTimeout: "120s",
   retry: {
     maximumAttempts: 5,
@@ -49,7 +48,7 @@ const browserActs = proxyActivities<typeof activities>({
 });
 
 /** Dispatch cycle — longer timeout since LLM inference can be slow. */
-const dispatchActs = proxyActivities<typeof activities>({
+const dispatchActs = proxyActivities<SisyphusActivities>({
   startToCloseTimeout: "300s",
   heartbeatTimeout: "60s",
   retry: {

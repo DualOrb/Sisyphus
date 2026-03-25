@@ -220,8 +220,25 @@ Live dispatch integration (API sync, Playwright selectors) deferred until dispat
 - [x] Old dispatch discovery doc (planning/12-old-dispatch-discovery.md)
 - [x] 91 adapter tests passing (31 client + 60 transformer)
 
+### System Initialization (Complete)
+- [x] `initializeConnections()` — boots Redis, PostgreSQL, dispatch adapter, Chrome, auth, session cookie
+- [x] `initializeServices()` — creates OntologyStore, syncer, LangGraph graph, event pipeline, WebSocket, presence, DispatchCycle
+- [x] `initializeSisyphus()` — single function that boots the entire system
+- [x] `shutdownSisyphus()` — graceful teardown in reverse order (syncer, WS, browser, Redis, PG, health)
+- [x] `createActivities()` factory — Temporal activities wired to live infrastructure (no lazy init)
+- [x] Temporal worker uses init system, starts health server, registers activities
+- [x] Main entry point (src/index.ts) simplified: worker start → schedule → shutdown handlers
+- [x] Non-fatal Chrome/auth failures — system boots in degraded mode without browser
+
+### AWS Integration (Complete)
+- [x] AWS Secrets Manager client (`@aws-sdk/client-secrets-manager`)
+- [x] `fetchDynaCloneCredentials()` — extracts DB creds from Secrets Manager (matches VendorPortal field names)
+- [x] `createDynaCloneFromSecrets()` — factory that creates DynaClone client from Secrets Manager
+- [x] 5-minute credential cache (matching existing VendorPortal pattern)
+- [x] 13 AWS secrets tests passing
+
 ### Test Summary
-- 388 unit/integration tests passing (579ms)
+- 401 unit/integration tests passing (573ms)
 - 7 simulation scenarios, 40 actions, all passing
 - 20 process files validated
 - 5 CLI tools working

@@ -1,7 +1,8 @@
 import { env } from "./config/index.js";
 import { logger } from "./lib/index.js";
 import { Connection, Client } from "@temporalio/client";
-import { startWorker, createShiftSchedule } from "./shift/index.js";
+import { startWorker, shutdownSystem } from "./shift/worker.js";
+import { createShiftSchedule } from "./shift/scheduler.js";
 
 // ---------------------------------------------------------------------------
 // Main
@@ -15,14 +16,18 @@ async function main(): Promise<void> {
       temporalAddress: env.TEMPORAL_ADDRESS,
       taskQueue: env.TEMPORAL_TASK_QUEUE,
       businessHours: `${env.BUSINESS_HOURS_START}-${env.BUSINESS_HOURS_END}`,
+      adapter: env.DISPATCH_ADAPTER,
+      mode: env.OPERATING_MODE,
     },
     "Sisyphus starting up",
   );
 
-  // ---- 1. Start the Temporal worker (runs in background) ----
-  logger.info("Starting Temporal worker...");
+  // ---- 1. Start the Temporal worker (handles its own init) ----
+  // The worker initializes all connections, services, health server,
+  // and activity functions before it starts polling for tasks.
+  logger.info("Starting Temporal worker (includes full system initialization)...");
   const worker = await startWorker();
-  logger.info("Temporal worker running");
+  logger.info("Temporal worker running — system fully initialized");
 
   // ---- 2. Create/update the shift schedule ----
   logger.info("Connecting to Temporal server for scheduling...");
@@ -56,9 +61,15 @@ async function main(): Promise<void> {
       logger.error({ err }, "Error during worker shutdown");
     }
 
-    // Give the worker time to finish in-flight tasks
-    // The worker.run() promise will resolve once shutdown completes.
-    // We set a hard exit timeout as a safety net.
+    // Shut down all Sisyphus connections and services
+    try {
+      await shutdownSystem();
+      logger.info("Sisyphus system shutdown complete");
+    } catch (err) {
+      logger.error({ err }, "Error during system shutdown");
+    }
+
+    // Safety net: force exit after 30s if shutdown hasn't completed
     setTimeout(() => {
       logger.warn("Shutdown timeout reached, forcing exit");
       process.exit(1);

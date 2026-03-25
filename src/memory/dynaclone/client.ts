@@ -1,6 +1,6 @@
 import * as mysql from "mysql2/promise";
 import type { Pool, PoolOptions, RowDataPacket } from "mysql2/promise";
-import { createChildLogger } from "../../lib/index.js";
+import { createChildLogger, fetchDynaCloneCredentials } from "../../lib/index.js";
 
 const log = createChildLogger("dynaclone");
 
@@ -119,4 +119,37 @@ export class DynaCloneClient {
       this.pool = null;
     }
   }
+}
+
+// ---------------------------------------------------------------------------
+// Factory: create a DynaCloneClient backed by AWS Secrets Manager
+// ---------------------------------------------------------------------------
+
+/**
+ * Create a {@link DynaCloneClient} whose credentials are lazily fetched from
+ * AWS Secrets Manager.
+ *
+ * The client uses a {@link SecretsLookupFn} so the actual network call is
+ * deferred until the first query, and the secret is cached in-process for
+ * 5 minutes (handled by `fetchDynaCloneCredentials`).
+ *
+ * @param secretId - Secret name or ARN (e.g. `vendorportal/credentials`)
+ * @param region   - AWS region (defaults to `us-east-1`)
+ */
+export function createDynaCloneFromSecrets(
+  secretId: string,
+  region = "us-east-1",
+): DynaCloneClient {
+  const lookup: SecretsLookupFn = async () => {
+    log.info({ secretId, region }, "Fetching DynaClone credentials from Secrets Manager");
+    const creds = await fetchDynaCloneCredentials(secretId, region);
+    return {
+      host: creds.host,
+      user: creds.user,
+      password: creds.password,
+      database: creds.database,
+    };
+  };
+
+  return new DynaCloneClient(lookup);
 }
