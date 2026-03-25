@@ -95,20 +95,28 @@ async function main() {
   // ---- 1. Sync from DynamoDB ------------------------------------------------
   console.log("  \x1b[36m[1/6]\x1b[0m Syncing from DynamoDB...");
 
-  // Get active orders (Pending, Confirmed, Ready, EnRoute, InTransit)
-  const activeStatuses = ["Pending", "Confirmed", "Ready", "EnRoute", "InTransit"];
-  const orderArrays = await Promise.all(activeStatuses.map((s) => queryByStatus("ValleyEats-Orders", s)));
+  // --- ORDERS: Only Placed, Confirmed, Ready, InTransit (matches dispatch.txt) ---
+  // InProgress = cart/unpaid, Delivered/Cancelled = done. None of these show in dispatch.
+  const dispatchStatuses = ["Placed", "Confirmed", "Ready", "InTransit"];
+  const orderArrays = await Promise.all(dispatchStatuses.map((s) => queryByStatus("ValleyEats-Orders", s)));
   const rawOrders = orderArrays.flat();
-  console.log(`    → ${rawOrders.length} active orders (${activeStatuses.map((s, i) => `${s}: ${orderArrays[i].length}`).join(", ")})`);
+  console.log(`    → ${rawOrders.length} dispatch-visible orders (${dispatchStatuses.map((s, i) => `${s}: ${orderArrays[i].length}`).join(", ")})`);
 
-  const rawDrivers = await scanAll("ValleyEats-Drivers");
-  console.log(`    → ${rawDrivers.length} drivers`);
+  // --- DRIVERS: Only Active=true (matches dispatch.txt Lambda filter) ---
+  // Of 748 total drivers, only ~453 are Active. dispatch.txt further filters to ~57 on-shift/available.
+  const allDrivers = await scanAll("ValleyEats-Drivers");
+  const rawDrivers = allDrivers.filter((d) => d.Active === true);
+  const onShiftDrivers = rawDrivers.filter((d) => d.Available === true || d.OnShift === true);
+  console.log(`    → ${rawDrivers.length} active drivers (of ${allDrivers.length} total), ${onShiftDrivers.length} on-shift/available`);
 
+  // --- MARKETS: From MarketMeters + AppSettings for zone config ---
   const rawMarkets = await scanAll("ValleyEats-MarketMeters");
   console.log(`    → ${rawMarkets.length} markets`);
 
-  const rawRestaurants = await scanAll("ValleyEats-Restaurants", 200);
-  console.log(`    → ${rawRestaurants.length} restaurants (capped at 200)`);
+  // --- RESTAURANTS: All active (Restaurant=true) ---
+  const allRestaurants = await scanAll("ValleyEats-Restaurants", 600);
+  const rawRestaurants = allRestaurants.filter((r) => r.Restaurant === true);
+  console.log(`    → ${rawRestaurants.length} active restaurants (of ${allRestaurants.length} total)`);
 
   // Get recent tickets (New and Pending)
   let rawTickets: any[] = [];
@@ -206,24 +214,31 @@ async function main() {
   const eventsForCycle = queue.drain().slice(0, 10);
 
   // Build a comprehensive situation report
-  const onlineDrivers = store.queryDrivers({ isAvailable: true });
-  const pendingOrders = store.queryOrders({ status: "Pending" });
-  const unassignedOrders = orders.filter((o: any) => !o.driverId && ["Pending", "Confirmed"].includes(o.status));
+  const availableDriversList = store.queryDrivers({ isAvailable: true });
+  const placedOrders = store.queryOrders({ status: "Placed" });
+  const confirmedOrders = store.queryOrders({ status: "Confirmed" });
+  const readyOrders = store.queryOrders({ status: "Ready" });
+  const inTransitOrders = store.queryOrders({ status: "InTransit" });
+  const unassignedOrders = orders.filter((o: any) => !o.driverId && ["Placed", "Confirmed"].includes(o.status));
+  const onShiftCount = drivers.filter((d: any) => d.isOnline).length;
 
   const situationReport = [
     `SISYPHUS SHADOW DISPATCH CYCLE — ${new Date().toISOString()}`,
+    `Operating mode: SHADOW (proposals only, no real actions)`,
     ``,
     `MARKET OVERVIEW:`,
-    ...markets.map((m: any) => `  ${m.market}: score=${m.score}, drivers=${m.availableDrivers}/${m.idealDrivers}, gap=${m.driverGap ?? 0}`),
+    ...markets.map((m: any) => `  ${m.market}: score=${m.score}, drivers=${m.availableDrivers}/${m.idealDrivers}`),
     ``,
     `DRIVER STATUS:`,
-    `  Total: ${drivers.length}, Available: ${onlineDrivers.length}`,
-    `  Online: ${drivers.filter((d: any) => d.isOnline).length}`,
+    `  Active drivers: ${drivers.length}`,
+    `  On-shift/available: ${onShiftCount}`,
+    `  On-call (Available toggle): ${availableDriversList.length}`,
     ``,
     `ORDER STATUS:`,
-    `  Active: ${orders.length} (Pending: ${pendingOrders.length}, Unassigned: ${unassignedOrders.length})`,
+    `  Placed: ${placedOrders.length}, Confirmed: ${confirmedOrders.length}, Ready: ${readyOrders.length}, InTransit: ${inTransitOrders.length}`,
+    `  Unassigned (no driver): ${unassignedOrders.length}`,
     ``,
-    `OPEN TICKETS: ${tickets.length}`,
+    `OPEN TICKETS: ${tickets.length} (New + Pending)`,
     ``,
   ].join("\n");
 
