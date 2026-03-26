@@ -140,6 +140,21 @@ defineAction({
   sideEffects: ["audit_log"],
   criteria: [
     {
+      name: "ticket_status_is_modifiable",
+      check: (params, state) => {
+        const store = state as unknown as OntologyStore;
+        const ticket = store.getTicket(params.ticketId as string);
+        if (!ticket) return { passed: false, message: "Ticket not found" };
+        if (!MODIFIABLE_STATUSES.includes(ticket.status)) {
+          return {
+            passed: false,
+            message: `Ticket status is ${ticket.status} — must be New or Pending`,
+          };
+        }
+        return { passed: true };
+      },
+    },
+    {
       name: "note_not_empty",
       check: (params) => {
         const note = params.note as string;
@@ -165,11 +180,17 @@ defineAction({
   sideEffects: ["audit_log"],
   criteria: [
     {
-      name: "ticket_exists",
+      name: "ticket_status_is_modifiable",
       check: (params, state) => {
         const store = state as unknown as OntologyStore;
         const ticket = store.getTicket(params.ticketId as string);
         if (!ticket) return { passed: false, message: "Ticket not found" };
+        if (!MODIFIABLE_STATUSES.includes(ticket.status)) {
+          return {
+            passed: false,
+            message: `Ticket status is ${ticket.status} — must be New or Pending`,
+          };
+        }
         return { passed: true };
       },
     },

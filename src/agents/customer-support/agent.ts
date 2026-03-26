@@ -75,6 +75,8 @@ const ALLOWED_TOOL_NAMES = new Set([
   "query_tickets",
   "query_restaurants",
   "get_order_details",
+  "get_ticket_details",
+  "query_driver_shifts",
   "get_entity_timeline",
   "execute_action",
   "request_clarification",

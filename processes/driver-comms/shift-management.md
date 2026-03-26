@@ -85,6 +85,24 @@ Thank couriers for their work. A courier who feels appreciated is more likely to
 
 > "Thank you for all your hard work today, have a great evening!"
 
+## Investigating Dropped Shift Tickets
+
+When a "Dropped Shift" ticket arrives:
+
+1. **Read the ticket details** using `get_ticket_details` to see the full description
+2. **Parse the shift time** from the description (format: [YYYY/MM/DD HH:MM:SS - HH:MM:SS])
+3. **Check if the ticket is already being handled** — if the Owner is not "Unassigned" and not you, someone else is on it. Skip.
+4. **Query scheduled shifts** using `query_driver_shifts` for that market and time window
+5. **Assess coverage**:
+   - Count how many drivers are scheduled for the dropped window
+   - If 3+ other drivers cover the same window: no coverage gap, resolve as "no_action"
+   - If 1-2 other drivers: borderline — note the risk but don't escalate yet
+   - If 0 other drivers: COVERAGE GAP — escalate immediately, push notification for open shifts
+6. **Document findings** with AddTicketNote including: which drivers are covering, any gap identified
+7. **Resolve or escalate** based on coverage assessment
+
+IMPORTANT: Check the FUTURE time of the dropped shift, not the current time. A shift dropping at 11 AM means checking 11 AM coverage, even if it's 8 AM right now.
+
 ## Payout Timing Reference
 
 Couriers are paid for the current week (Saturday to Friday) on the following Friday. If a courier has payout questions, direct them to relations@valleyeats.ca.

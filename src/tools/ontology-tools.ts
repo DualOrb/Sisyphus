@@ -20,6 +20,8 @@ import type { OntologyStore } from "../ontology/state/index.js";
 import { executeAction } from "../guardrails/index.js";
 import type { ExecutionContext } from "../guardrails/index.js";
 import { createChildLogger } from "../lib/index.js";
+import { DynamoDBClient, QueryCommand } from "@aws-sdk/client-dynamodb";
+import { unmarshall } from "@aws-sdk/util-dynamodb";
 
 const log = createChildLogger("ontology-tools");
 
@@ -35,11 +37,13 @@ const log = createChildLogger("ontology-tools");
  * @param store  The in-memory ontology state store (populated by sync layer).
  * @param redis  Redis client for cooldowns, timelines, and action execution.
  * @param agentId  Default agent identifier used for audit trail attribution.
+ * @param dynamoClient  Optional DynamoDB client for direct table queries (e.g. DriverShifts).
  */
 export function createOntologyTools(
   store: OntologyStore,
   redis: RedisClient,
   agentId = "sisyphus",
+  dynamoClient?: DynamoDBClient,
 ): DynamicStructuredTool[] {
   // ------------------------------------------------------------------
   // 1. query_orders — Query orders with optional filters
@@ -674,6 +678,183 @@ export function createOntologyTools(
   });
 
   // ------------------------------------------------------------------
+  // 10. get_ticket_details — Full ticket with embedded history
+  // ------------------------------------------------------------------
+
+  const getTicketDetailsTool = new DynamicStructuredTool({
+    name: "get_ticket_details",
+    description:
+      "Get full details for a specific support ticket including description, notes, actions history, " +
+      "and messages. Use this when you need the complete context of a ticket — for example, to read " +
+      "the full description of a Dropped Shift ticket or to see what notes and actions have already " +
+      "been taken. Takes a ticketId (8-char hash like '7645aca1').",
+    schema: z.object({
+      ticketId: z
+        .string()
+        .describe("The 8-character hash ID of the ticket (e.g. '7645aca1')"),
+    }),
+    func: async (input) => {
+      try {
+        const ticket = store.getTicket(input.ticketId);
+        if (!ticket) {
+          return JSON.stringify({
+            error: "Ticket not found",
+            ticketId: input.ticketId,
+          });
+        }
+
+        // Resolve linked entities
+        const relatedOrder = ticket.orderId
+          ? store.getOrder(ticket.orderId)
+          : undefined;
+        const relatedDriver = ticket.driverId
+          ? store.getDriver(ticket.driverId)
+          : undefined;
+
+        const result = {
+          ticket: {
+            issueId: ticket.issueId,
+            status: ticket.status,
+            category: ticket.category,
+            issueType: ticket.issueType,
+            market: ticket.market ?? null,
+            originator: ticket.originator,
+            owner: ticket.owner,
+            description: ticket.description,
+            createdAt: ticket.createdAt.toISOString(),
+          },
+          notes: (ticket.notes ?? []).map((n) => ({
+            author: n.author,
+            note: n.note,
+            timestamp: n.timestamp.toISOString(),
+          })),
+          actions: (ticket.actions ?? []).map((a) => ({
+            actor: a.actor,
+            description: a.description,
+            timestamp: a.timestamp.toISOString(),
+          })),
+          messages: (ticket.messages ?? []).map((m) => ({
+            originator: m.originator,
+            message: m.message,
+            timestamp: m.sent.toISOString(),
+          })),
+          relatedOrder: relatedOrder
+            ? {
+                orderId: relatedOrder.orderId,
+                orderIdKey: relatedOrder.orderIdKey,
+                status: relatedOrder.status,
+                restaurantName: relatedOrder.restaurantName,
+                driverId: relatedOrder.driverId,
+                deliveryZone: relatedOrder.deliveryZone,
+                placedAt: relatedOrder.placedAt.toISOString(),
+                isLate: relatedOrder.isLate,
+              }
+            : null,
+          relatedDriver: relatedDriver
+            ? {
+                driverId: relatedDriver.driverId,
+                name: relatedDriver.name,
+                phone: relatedDriver.phone,
+                dispatchZone: relatedDriver.dispatchZone,
+                isOnline: relatedDriver.isOnline,
+                activeOrdersCount: relatedDriver.activeOrdersCount,
+              }
+            : null,
+        };
+
+        return JSON.stringify(result);
+      } catch (err) {
+        log.error({ err, input }, "get_ticket_details failed");
+        return JSON.stringify({
+          error: "Failed to get ticket details",
+          details: String(err),
+        });
+      }
+    },
+  });
+
+  // ------------------------------------------------------------------
+  // 11. query_driver_shifts — Check shift coverage via DynamoDB
+  // ------------------------------------------------------------------
+
+  const queryDriverShiftsTool = new DynamicStructuredTool({
+    name: "query_driver_shifts",
+    description:
+      "Check which drivers are scheduled for shifts in a market during a time window. " +
+      "Use this to verify coverage when a driver drops a shift. Queries the DynamoDB " +
+      "ValleyEats-DriverShifts table directly. Takes a market name and a time range.",
+    schema: z.object({
+      market: z
+        .string()
+        .describe("Market name (e.g. 'Pembroke')"),
+      startTime: z
+        .string()
+        .describe("Start of the time window as ISO datetime (e.g. '2026-03-26T11:00:00')"),
+      endTime: z
+        .string()
+        .describe("End of the time window as ISO datetime (e.g. '2026-03-26T16:00:00')"),
+    }),
+    func: async (input) => {
+      try {
+        if (!dynamoClient) {
+          return JSON.stringify({
+            error: "DynamoDB not available. Cannot query driver shifts.",
+          });
+        }
+
+        const startEpoch = Math.floor(new Date(input.startTime).getTime() / 1000);
+        const endEpoch = Math.floor(new Date(input.endTime).getTime() / 1000);
+
+        if (isNaN(startEpoch) || isNaN(endEpoch)) {
+          return JSON.stringify({
+            error: "Invalid date format. Use ISO datetime (e.g. '2026-03-26T11:00:00').",
+          });
+        }
+
+        const command = new QueryCommand({
+          TableName: "ValleyEats-DriverShifts",
+          IndexName: "Market-index",
+          KeyConditionExpression:
+            "Market = :m AND shiftstart BETWEEN :start AND :end",
+          ExpressionAttributeValues: {
+            ":m": { S: input.market },
+            ":start": { N: String(startEpoch) },
+            ":end": { N: String(endEpoch) },
+          },
+        });
+
+        const response = await dynamoClient.send(command);
+        const items = (response.Items ?? []).map((item) => unmarshall(item));
+
+        const shifts = items.map((item) => {
+          const driverId = (item.DriverId as string) ?? "";
+          const driver = store.getDriver(driverId);
+          return {
+            driverId,
+            driverName: driver?.name ?? driverId.split("@")[0],
+            shiftStart: new Date((item.shiftstart as number) * 1000).toISOString(),
+            shiftEnd: new Date((item.shiftend as number) * 1000).toISOString(),
+          };
+        });
+
+        return JSON.stringify({
+          market: input.market,
+          startTime: input.startTime,
+          endTime: input.endTime,
+          count: shifts.length,
+          shifts,
+        });
+      } catch (err) {
+        log.error({ err, input }, "query_driver_shifts failed");
+        return JSON.stringify({
+          error: "Failed to query driver shifts",
+          details: String(err),
+        });
+      }
+    },
+  });
+
+  // ------------------------------------------------------------------
   // Return all tools
   // ------------------------------------------------------------------
 
@@ -684,6 +865,8 @@ export function createOntologyTools(
     queryRestaurantsTool,
     queryConversationsTool,
     getOrderDetailsTool,
+    getTicketDetailsTool,
+    queryDriverShiftsTool,
     getEntityTimelineTool,
     executeActionTool,
     requestClarificationTool,
