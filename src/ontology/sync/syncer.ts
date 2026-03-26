@@ -24,6 +24,17 @@ import {
 } from "./transformer.js";
 
 // ---------------------------------------------------------------------------
+// Hardcoded restaurant exclusions
+// These restaurants are always excluded from the dispatch table.
+// See planning/13-dispatch-data-filters.md "Restaurant Exclusion (hardcoded)"
+// ---------------------------------------------------------------------------
+
+const EXCLUDED_RESTAURANT_IDS = new Set([
+  "ab8a647e-4c41-4afb-9a93-9da5fdffe93d",
+  "70b13a1d-24b1-4114-8662-6854bfa38591",
+]);
+
+// ---------------------------------------------------------------------------
 // OntologySyncer
 // ---------------------------------------------------------------------------
 
@@ -305,6 +316,14 @@ export class OntologySyncer {
     const startMs = Date.now();
 
     try {
+      // Merge hardcoded restaurant exclusions with any caller-provided exclusions
+      const allExclusions = new Set<string>(EXCLUDED_RESTAURANT_IDS);
+      if (excludeRestaurants) {
+        for (const id of excludeRestaurants) {
+          allExclusions.add(id);
+        }
+      }
+
       const zones = Object.keys(data).filter((k) => k !== "Timestamp");
 
       const orders: ReturnType<typeof transformOrder>[] = [];
@@ -335,7 +354,7 @@ export class OntologySyncer {
         // Orders
         if (zoneData?.Orders) {
           for (const o of zoneData.Orders) {
-            if (excludeRestaurants?.has(o.RestaurantId)) continue;
+            if (allExclusions.has(o.RestaurantId)) continue;
             try {
               orders.push(
                 transformOrder({

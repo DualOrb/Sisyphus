@@ -71,6 +71,7 @@ Escalate to supervisor (via request_clarification) if:
 const ALLOWED_TOOL_NAMES = new Set([
   "query_orders",
   "query_drivers",
+  "query_conversations",
   "get_order_details",
   "get_entity_timeline",
   "execute_action",

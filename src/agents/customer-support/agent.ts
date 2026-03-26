@@ -73,6 +73,7 @@ Escalate to supervisor if:
 const ALLOWED_TOOL_NAMES = new Set([
   "query_orders",
   "query_tickets",
+  "query_restaurants",
   "get_order_details",
   "get_entity_timeline",
   "execute_action",

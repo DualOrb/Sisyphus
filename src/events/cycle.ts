@@ -106,6 +106,8 @@ export interface DispatchCycleConfig {
   redis: RedisClient;
   heartbeatIntervalMs?: number;
   llmCooldownMs?: number;
+  /** Previous shift handoff data for cross-shift awareness (first cycle only). */
+  shiftHandoff?: { notes?: string | null; issues?: unknown; escalations?: number | null } | null;
 }
 
 // ---------------------------------------------------------------------------
@@ -122,6 +124,7 @@ export class DispatchCycle {
   private readonly dispatcher: EventDispatcher;
   private readonly heartbeatIntervalMs: number;
   private readonly llmCooldownMs: number;
+  private readonly shiftHandoff: DispatchCycleConfig["shiftHandoff"];
 
   // -- State maintained between run() calls --
   private previousDispatchData: any = null;
@@ -143,6 +146,7 @@ export class DispatchCycle {
     this.dispatcher = new EventDispatcher();
     this.heartbeatIntervalMs = config.heartbeatIntervalMs ?? DEFAULT_HEARTBEAT_INTERVAL_MS;
     this.llmCooldownMs = config.llmCooldownMs ?? DEFAULT_LLM_COOLDOWN_MS;
+    this.shiftHandoff = config.shiftHandoff ?? null;
   }
 
   // =========================================================================
@@ -240,9 +244,29 @@ export class DispatchCycle {
     // ------------------------------------------------------------------
     let combinedPrompt = "";
 
+    // Prepend previous shift handoff on first cycle
+    if (this.isFirstCycle && this.shiftHandoff) {
+      const handoffParts: string[] = [];
+      if (this.shiftHandoff.notes) {
+        handoffParts.push(`Notes: ${this.shiftHandoff.notes}`);
+      }
+      if (this.shiftHandoff.issues) {
+        const issuesStr = typeof this.shiftHandoff.issues === "string"
+          ? this.shiftHandoff.issues
+          : JSON.stringify(this.shiftHandoff.issues);
+        handoffParts.push(`Unresolved issues: ${issuesStr}`);
+      }
+      if (this.shiftHandoff.escalations && this.shiftHandoff.escalations > 0) {
+        handoffParts.push(`Escalations from previous shift: ${this.shiftHandoff.escalations}`);
+      }
+      if (handoffParts.length > 0) {
+        combinedPrompt = `PREVIOUS SHIFT HANDOFF: ${handoffParts.join(" | ")}\n\n`;
+      }
+    }
+
     // Prepend rolling context summary from previous cycle
     if (this.cycleSummary) {
-      combinedPrompt = `PREVIOUS CYCLE SUMMARY: ${this.cycleSummary}\n\n`;
+      combinedPrompt += `PREVIOUS CYCLE SUMMARY: ${this.cycleSummary}\n\n`;
     }
 
     // Build situation prompt from dispatch.txt changes

@@ -484,7 +484,113 @@ export function createOntologyTools(
   });
 
   // ------------------------------------------------------------------
-  // 7. request_clarification — Pause and request help
+  // 7. query_restaurants — Query restaurants with optional filters
+  // ------------------------------------------------------------------
+
+  const queryRestaurantsTool = new DynamicStructuredTool({
+    name: "query_restaurants",
+    description:
+      "Query restaurants from the ontology with optional filters. Returns an array of restaurant summaries " +
+      "including restaurantId, restaurantIdKey, name, deliveryZone, isActive, isOpen, isTabletOnline, " +
+      "cuisine, and posEta. Use this to check restaurant health, find restaurants in a zone, or look up " +
+      "restaurant info for tickets.",
+    schema: z.object({
+      deliveryZone: z
+        .string()
+        .nullable().optional()
+        .describe("Filter by delivery zone / market name"),
+      isActive: z
+        .boolean()
+        .nullable().optional()
+        .describe("Filter by active status on the platform"),
+      isOpen: z
+        .boolean()
+        .nullable().optional()
+        .describe("Filter by whether restaurant is currently within kitchen hours"),
+    }),
+    func: async (input) => {
+      try {
+        const restaurants = store.queryRestaurants({
+          deliveryZone: input.deliveryZone ?? undefined,
+          isActive: input.isActive ?? undefined,
+          isOpen: input.isOpen ?? undefined,
+        });
+
+        const summaries = restaurants.map((r) => ({
+          restaurantId: r.restaurantId,
+          restaurantIdKey: r.restaurantIdKey,
+          name: r.name,
+          deliveryZone: r.deliveryZone,
+          isActive: r.isActive,
+          isOpen: r.isOpen,
+          isTabletOnline: r.isTabletOnline,
+          cuisine: r.cuisine ?? null,
+          posEta: r.posEta ?? null,
+        }));
+
+        return JSON.stringify({
+          count: summaries.length,
+          restaurants: summaries,
+        });
+      } catch (err) {
+        log.error({ err, input }, "query_restaurants failed");
+        return JSON.stringify({
+          error: "Failed to query restaurants",
+          details: String(err),
+        });
+      }
+    },
+  });
+
+  // ------------------------------------------------------------------
+  // 8. query_conversations — Query driver conversations
+  // ------------------------------------------------------------------
+
+  const queryConversationsTool = new DynamicStructuredTool({
+    name: "query_conversations",
+    description:
+      "Query driver conversations from the ontology. Returns a list of conversations with driverId, " +
+      "driverName (looked up from the driver store), lastMessagePreview, lastMessageAt, and hasUnread. " +
+      "Use this to check message history and find conversations that need attention.",
+    schema: z.object({
+      hasUnread: z
+        .boolean()
+        .nullable().optional()
+        .describe("Filter by unread status (true = only conversations with unread messages)"),
+    }),
+    func: async (input) => {
+      try {
+        const conversations = store.queryConversations({
+          hasUnread: input.hasUnread ?? undefined,
+        });
+
+        const summaries = conversations.map((c) => {
+          const driver = store.getDriver(c.driverId);
+          return {
+            driverId: c.driverId,
+            driverName: driver?.name ?? c.driverId.split("@")[0],
+            lastMessagePreview: c.lastMessagePreview,
+            lastMessageAt: c.lastMessageAt.toISOString(),
+            hasUnread: c.hasUnread,
+          };
+        });
+
+        return JSON.stringify({
+          count: summaries.length,
+          conversations: summaries,
+        });
+      } catch (err) {
+        log.error({ err, input }, "query_conversations failed");
+        return JSON.stringify({
+          error: "Failed to query conversations",
+          details: String(err),
+        });
+      }
+    },
+  });
+
+  // ------------------------------------------------------------------
+  // 9. request_clarification — Pause and request help
   // ------------------------------------------------------------------
 
   const requestClarificationTool = new DynamicStructuredTool({
@@ -575,6 +681,8 @@ export function createOntologyTools(
     queryOrdersTool,
     queryDriversTool,
     queryTicketsTool,
+    queryRestaurantsTool,
+    queryConversationsTool,
     getOrderDetailsTool,
     getEntityTimelineTool,
     executeActionTool,

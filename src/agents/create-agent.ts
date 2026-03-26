@@ -24,7 +24,9 @@ import {
   type BaseMessage,
 } from "@langchain/core/messages";
 import type { DynamicStructuredTool } from "@langchain/core/tools";
+import type { Redis as RedisClient } from "ioredis";
 import type { AgentStateType, AgentStateUpdate } from "./state.js";
+import { sendHeartbeat } from "../memory/redis/heartbeat.js";
 import { createChildLogger } from "../lib/index.js";
 
 const log = createChildLogger("create-agent");
@@ -47,6 +49,11 @@ export interface AgentNodeConfig {
    * to return. Prevents runaway loops.  Default: 10.
    */
   maxIterations?: number;
+  /**
+   * Optional Redis client for sending agent heartbeats.
+   * When provided, heartbeats are sent at the start and every 5 iterations.
+   */
+  redis?: RedisClient;
 }
 
 // ---------------------------------------------------------------------------
@@ -63,7 +70,7 @@ export interface AgentNodeConfig {
 export function createAgentNode(
   config: AgentNodeConfig,
 ): (state: AgentStateType) => Promise<AgentStateUpdate> {
-  const { name, systemPrompt, tools, model, maxIterations = 10 } = config;
+  const { name, systemPrompt, tools, model, maxIterations = 10, redis } = config;
 
   // Bind tools to the model so it knows what's available
   const modelWithTools =
@@ -74,6 +81,15 @@ export function createAgentNode(
 
   return async (state: AgentStateType): Promise<AgentStateUpdate> => {
     log.info({ agent: name, task: state.currentTask }, "Agent invoked");
+
+    // Send initial heartbeat
+    if (redis) {
+      try {
+        await sendHeartbeat(redis, name);
+      } catch (err) {
+        log.warn({ err, agent: name }, "Failed to send initial heartbeat");
+      }
+    }
 
     // Build the message list: system prompt + conversation history
     const systemMsg = new SystemMessage(systemPrompt);
@@ -92,6 +108,15 @@ export function createAgentNode(
 
     while (iterations < maxIterations) {
       iterations += 1;
+
+      // Send periodic heartbeat every 5 iterations
+      if (redis && iterations % 5 === 0) {
+        try {
+          await sendHeartbeat(redis, name);
+        } catch (err) {
+          log.warn({ err, agent: name, iteration: iterations }, "Failed to send periodic heartbeat");
+        }
+      }
 
       // When one iteration remains, inject a system message forcing the
       // agent to summarise rather than making more tool calls. This

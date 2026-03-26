@@ -58,6 +58,7 @@ You are the Market Monitor agent for Sisyphus. Your job is to watch the overall 
 const ALLOWED_TOOL_NAMES = new Set([
   "query_orders",
   "query_drivers",
+  "query_restaurants",
   "get_entity_timeline",
   "execute_action",
   "lookup_process",

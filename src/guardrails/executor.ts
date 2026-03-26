@@ -39,6 +39,52 @@ import type {
 // ---------------------------------------------------------------------------
 
 /**
+ * Snapshot the relevant entity from the OntologyStore before/after execution.
+ * The `state` in ExecutionContext is the OntologyStore cast as Record<string, unknown>.
+ * We detect the entity type from the action params and snapshot accordingly.
+ */
+function snapshotEntityState(
+  state: Record<string, unknown> | undefined,
+  params: Record<string, unknown>,
+): Record<string, unknown> {
+  if (!state) return {};
+
+  try {
+    // Try order
+    const orderId = params.orderId ?? params.order_id;
+    if (orderId && typeof orderId === "string" && typeof (state as any).getOrder === "function") {
+      const order = (state as any).getOrder(orderId);
+      if (order) return JSON.parse(JSON.stringify(order));
+    }
+
+    // Try driver
+    const driverId = params.driverId ?? params.driver_id;
+    if (driverId && typeof driverId === "string" && typeof (state as any).getDriver === "function") {
+      const driver = (state as any).getDriver(driverId);
+      if (driver) return JSON.parse(JSON.stringify(driver));
+    }
+
+    // Try ticket
+    const ticketId = params.ticketId ?? params.ticket_id ?? params.issueId ?? params.issue_id;
+    if (ticketId && typeof ticketId === "string" && typeof (state as any).getTicket === "function") {
+      const ticket = (state as any).getTicket(ticketId);
+      if (ticket) return JSON.parse(JSON.stringify(ticket));
+    }
+
+    // Try market
+    const market = params.market ?? params.zone;
+    if (market && typeof market === "string" && typeof (state as any).getMarket === "function") {
+      const marketEntity = (state as any).getMarket(market);
+      if (marketEntity) return JSON.parse(JSON.stringify(marketEntity));
+    }
+  } catch {
+    // Snapshot is best-effort; never block execution
+  }
+
+  return {};
+}
+
+/**
  * Resolve a cooldown entity ID from action params.
  *
  * When a CooldownConfig specifies entity = "order", we look for `order_id`
@@ -171,7 +217,10 @@ export async function executeAction(
     };
   }
 
-  // 7. Check autonomy tier
+  // 7. Snapshot entity state BEFORE execution
+  const beforeState = snapshotEntityState(state as Record<string, unknown> | undefined, validatedParams);
+
+  // 8. Check autonomy tier
   if (!shouldAutoExecute(action.tier as Tier)) {
     // ORANGE and RED actions are staged for review
     const auditRecord = buildAuditRecord({
@@ -183,6 +232,8 @@ export async function executeAction(
       outcome: "staged",
       startTime,
       context,
+      beforeState,
+      afterState: beforeState, // No mutation for staged actions
     });
     await onAudit?.(auditRecord);
 
@@ -196,11 +247,11 @@ export async function executeAction(
     };
   }
 
-  // 8. Execute the action
+  // 9. Execute the action
   // TODO: Wire real browser/API executors here based on action.execution.
   // For now we treat every action as successfully executed once it passes all checks.
 
-  // 9. Set cooldown after successful execution
+  // 10. Set cooldown after successful execution
   if (action.cooldown) {
     const entityId = resolveCooldownEntityId(action.cooldown.entity, validatedParams);
     if (entityId) {
@@ -218,7 +269,10 @@ export async function executeAction(
   // Record success (resets circuit breaker)
   await recordSuccess(redis, agentId);
 
-  // 10. Build and emit audit record
+  // 11. Snapshot entity state AFTER execution (same as before in shadow mode)
+  const afterState = snapshotEntityState(state as Record<string, unknown> | undefined, validatedParams);
+
+  // 12. Build and emit audit record
   const auditRecord = buildAuditRecord({
     action,
     agentId,
@@ -228,10 +282,12 @@ export async function executeAction(
     outcome: "executed",
     startTime,
     context,
+    beforeState,
+    afterState,
   });
   await onAudit?.(auditRecord);
 
-  // 11. Return result
+  // 13. Return result
   return {
     success: true,
     outcome: "executed",
@@ -252,6 +308,8 @@ interface AuditBuildInput {
   outcome: AuditRecord["outcome"];
   startTime: number;
   context: ExecutionContext;
+  beforeState?: Record<string, unknown>;
+  afterState?: Record<string, unknown>;
 }
 
 function buildAuditRecord(input: AuditBuildInput): AuditRecord {
@@ -283,8 +341,8 @@ function buildAuditRecord(input: AuditBuildInput): AuditRecord {
     reasoning,
     submissionCheck,
     outcome,
-    beforeState: {}, // TODO: capture from ontology state before execution
-    afterState: {}, // TODO: capture from ontology state after execution
+    beforeState: input.beforeState ?? {},
+    afterState: input.afterState ?? {},
     sideEffectsFired: outcome === "executed" ? (action.sideEffects ?? []) : [],
     executionTimeMs: Date.now() - startTime,
     llmModel: context.llmModel ?? "unknown",

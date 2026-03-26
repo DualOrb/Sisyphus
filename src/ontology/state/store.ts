@@ -37,6 +37,16 @@ export interface TicketFilter {
   owner?: string;
 }
 
+export interface RestaurantFilter {
+  deliveryZone?: string;
+  isActive?: boolean;
+  isOpen?: boolean;
+}
+
+export interface ConversationFilter {
+  hasUnread?: boolean;
+}
+
 // ---------------------------------------------------------------------------
 // Store stats (returned by getStats)
 // ---------------------------------------------------------------------------
@@ -133,6 +143,26 @@ export class OntologyStore {
       if (filter.market !== undefined && ticket.market !== filter.market) continue;
       if (filter.owner !== undefined && ticket.owner !== filter.owner) continue;
       results.push(ticket);
+    }
+    return results;
+  }
+
+  queryRestaurants(filter: RestaurantFilter): Restaurant[] {
+    const results: Restaurant[] = [];
+    for (const restaurant of this.restaurants.values()) {
+      if (filter.deliveryZone !== undefined && restaurant.deliveryZone !== filter.deliveryZone) continue;
+      if (filter.isActive !== undefined && restaurant.isActive !== filter.isActive) continue;
+      if (filter.isOpen !== undefined && restaurant.isOpen !== filter.isOpen) continue;
+      results.push(restaurant);
+    }
+    return results;
+  }
+
+  queryConversations(filter: ConversationFilter): Conversation[] {
+    const results: Conversation[] = [];
+    for (const conversation of this.conversations.values()) {
+      if (filter.hasUnread !== undefined && conversation.hasUnread !== filter.hasUnread) continue;
+      results.push(conversation);
     }
     return results;
   }

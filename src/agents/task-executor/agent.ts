@@ -58,6 +58,7 @@ You are the Task Executor agent for Sisyphus. You are a shared utility that perf
 // ---------------------------------------------------------------------------
 
 const ALLOWED_TOOL_NAMES = new Set([
+  "query_restaurants",
   "execute_action",
   "request_clarification",
   "lookup_process",

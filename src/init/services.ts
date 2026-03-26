@@ -37,7 +37,7 @@ import { SisyphusPresence } from "../execution/websocket/presence.js";
 import { ShadowExecutor } from "../execution/shadow/executor.js";
 import { ShadowMetrics } from "../execution/shadow/metrics.js";
 import { isShadowMode } from "../config/mode.js";
-import { writeAuditRecord } from "../memory/postgres/queries.js";
+import { writeAuditRecord, getShiftHandoff } from "../memory/postgres/queries.js";
 import { startHealthServer } from "../health/server.js";
 import {
   checkRedis,
@@ -47,6 +47,7 @@ import {
 } from "../health/checks.js";
 import { createChildLogger } from "../lib/logger.js";
 import type { AuditRecord } from "../guardrails/types.js";
+import type { ShiftSummaryRow } from "../../db/schema.js";
 
 const log = createChildLogger("init:services");
 
@@ -81,6 +82,8 @@ export interface SisyphusServices {
   shiftId: string;
   /** Accumulated audit records for shift report generation. */
   auditRecords: AuditRecord[];
+  /** Previous shift handoff data for cross-shift awareness. */
+  shiftHandoff: ShiftSummaryRow | null;
 }
 
 // ---------------------------------------------------------------------------
@@ -161,6 +164,28 @@ export async function initializeServices(
       { err },
       "Initial ontology sync failed — continuing with empty store (sync will retry on next cycle)",
     );
+  }
+
+  // ---- 4b. Retrieve previous shift handoff for cross-shift awareness -------
+  let shiftHandoff: ShiftSummaryRow | null = null;
+  try {
+    shiftHandoff = await getShiftHandoff(connections.db);
+    if (shiftHandoff) {
+      log.info(
+        {
+          shiftDate: shiftHandoff.shiftDate,
+          totalActions: shiftHandoff.totalActions,
+          escalations: shiftHandoff.escalations,
+          hasNotes: !!shiftHandoff.notes,
+          hasIssues: !!shiftHandoff.issues,
+        },
+        "Previous shift handoff retrieved",
+      );
+    } else {
+      log.info("No previous shift handoff found");
+    }
+  } catch (err) {
+    log.warn({ err }, "Failed to retrieve shift handoff — continuing without cross-shift context");
   }
 
   // ---- 5. Create ShadowExecutor and ShadowMetrics --------------------------
@@ -295,6 +320,7 @@ export async function initializeServices(
     eventQueue,
     messageListener,
     redis: connections.redis,
+    shiftHandoff,
   });
   log.info("DispatchCycle created");
 
@@ -333,5 +359,6 @@ export async function initializeServices(
     healthServer,
     shiftId,
     auditRecords,
+    shiftHandoff,
   };
 }
