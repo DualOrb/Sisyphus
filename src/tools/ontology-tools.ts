@@ -129,10 +129,12 @@ export function createOntologyTools(
         const summaries = drivers.map((d) => ({
           driverId: d.driverId,
           name: d.name,
+          monacher: d.monacher ?? null,
           dispatchZone: d.dispatchZone,
           isAvailable: d.isAvailable,
           isPaused: d.isPaused,
           isOnline: d.isOnline,
+          status: d.status,
           activeOrdersCount: d.activeOrdersCount,
         }));
 

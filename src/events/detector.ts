@@ -86,13 +86,24 @@ export class EventDetector {
     now: Date,
   ): void {
     for (const market of store.markets.values()) {
-      if (market.score > 80) {
+      // Skip markets that are not operating or currently closed.
+      // Markets with no drivers AND no orders AND score=100 are typically
+      // either not-operating (hours set to -1) or closed for the night.
+      // Only flag markets that SHOULD have drivers but don't.
+      if (market.availableDrivers === 0 && market.activeOrders === 0) {
+        // No drivers, no orders — this market is either closed or not operating.
+        // Don't flag it. It's not an emergency if nobody is ordering.
+        continue;
+      }
+
+      // Only flag if there are active orders with insufficient drivers
+      if (market.availableDrivers === 0 && market.activeOrders > 0) {
         events.push({
           event: this.buildMarketAlertEvent(market, "critical"),
           priority: "high",
           createdAt: now,
         });
-      } else if (market.score > 60) {
+      } else if (market.score > 60 && market.availableDrivers > 0) {
         events.push({
           event: this.buildMarketAlertEvent(market, "warning"),
           priority: "normal",
@@ -163,7 +174,7 @@ export class EventDetector {
               driverName: driver.name,
               activeOrders: driver.activeOrdersCount,
             },
-            priority: "critical",
+            priority: "normal",
             createdAt: now,
           });
         }
@@ -187,7 +198,7 @@ export class EventDetector {
           driverName: driver.name,
           activeOrders: driver.activeOrdersCount,
         },
-        priority: "critical",
+        priority: "normal",
         createdAt: now,
       });
     }

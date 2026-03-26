@@ -187,9 +187,14 @@ export function transformDriver(raw: any): Driver {
   const isAvailable = bool(raw?.Available);
   const isPaused = bool(raw?.Paused);
   const isActive = bool(raw?.Active, true);
+  const onShift = bool(raw?.OnShift);
   const connectionId: string | null = raw?.ConnectionId ? str(raw.ConnectionId) : null;
 
-  const isOnline = isAvailable && !isPaused && connectionId != null;
+  // A driver is "online" if they're on-shift OR available (on-call), AND not paused.
+  // dispatch.txt uses OnShift=true for drivers currently working a shift.
+  // Available=true means the driver toggled on-call in the app.
+  // Either makes them available for dispatch.
+  const isOnline = (onShift || isAvailable) && !isPaused;
 
   // Derive logical status from raw flags
   let status: Driver["status"];
@@ -197,10 +202,10 @@ export function transformDriver(raw: any): Driver {
     status = "Inactive";
   } else if (isPaused) {
     status = "OnBreak";
-  } else if (!isAvailable || connectionId == null) {
-    status = "Offline";
-  } else {
+  } else if (onShift || isAvailable) {
     status = "Online";
+  } else {
+    status = "Offline";
   }
 
   // Parse app settings if present
@@ -219,6 +224,7 @@ export function transformDriver(raw: any): Driver {
     driverId: str(raw?.DriverId),
     name: str(raw?.FullName, "Unknown Driver"),
     phone: str(raw?.Phone),
+    monacher: raw?.Monacher ? str(raw.Monacher) : undefined,
     agentId: raw?.AgentId ?? undefined,
 
     dispatchZone: str(raw?.DispatchZone),

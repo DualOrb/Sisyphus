@@ -213,12 +213,13 @@ describe("EventDetector", () => {
   // -------------------------------------------------------------------------
 
   describe("market alerts", () => {
-    it("detects markets with score > 80 as high priority", () => {
+    it("detects market with 0 drivers but active orders as high priority", () => {
       const market = buildMarket({
         market: "Perth",
         score: 85,
-        idealDrivers: 8,
-        availableDrivers: 2,
+        idealDrivers: 3,
+        availableDrivers: 0,
+        activeOrders: 2,
       });
       store.updateMarkets([market]);
 
@@ -230,9 +231,23 @@ describe("EventDetector", () => {
       const evt = alerts[0].event;
       if (evt.type === "market_alert") {
         expect(evt.market).toBe("Perth");
-        expect(evt.score).toBe(85);
         expect(evt.alertLevel).toBe("critical");
       }
+    });
+
+    it("ignores markets with 0 drivers and 0 orders (closed/not operating)", () => {
+      const market = buildMarket({
+        market: "Bancroft",
+        score: 100,
+        idealDrivers: 3,
+        availableDrivers: 0,
+        activeOrders: 0,
+      });
+      store.updateMarkets([market]);
+
+      const events = detector.detect(store);
+      const alerts = events.filter((e) => e.event.type === "market_alert");
+      expect(alerts).toHaveLength(0);
     });
 
     it("detects markets with score > 60 as normal priority", () => {
@@ -285,7 +300,7 @@ describe("EventDetector", () => {
       const events = detector.detect(store);
       const offline = events.filter((e) => e.event.type === "driver_offline");
       expect(offline).toHaveLength(1);
-      expect(offline[0].priority).toBe("critical");
+      expect(offline[0].priority).toBe("normal");
 
       const evt = offline[0].event;
       if (evt.type === "driver_offline") {
@@ -321,7 +336,7 @@ describe("EventDetector", () => {
       const events = detector.detect(store, previousStore);
       const offline = events.filter((e) => e.event.type === "driver_offline");
       expect(offline).toHaveLength(1);
-      expect(offline[0].priority).toBe("critical");
+      expect(offline[0].priority).toBe("normal");
     });
 
     it("does not fire for driver already offline in previous store", () => {
@@ -450,16 +465,8 @@ describe("EventDetector", () => {
   // -------------------------------------------------------------------------
 
   describe("priority ordering", () => {
-    it("returns events sorted critical > high > normal > low", () => {
-      // Offline driver (critical), unassigned order (high), hot market (normal)
-      store.updateDrivers([
-        buildDriver({
-          driverId: "offline@test.com",
-          name: "Offline Dan",
-          isOnline: false,
-          activeOrdersCount: 1,
-        }),
-      ]);
+    it("returns events sorted high > normal > low", () => {
+      // Unassigned order (high), hot market with drivers (normal), offline driver (normal)
       store.updateOrders([
         buildOrder({
           orderId: "unassigned-ord",
@@ -469,16 +476,24 @@ describe("EventDetector", () => {
         }),
       ]);
       store.updateMarkets([
-        buildMarket({ market: "Perth", score: 65 }),
+        buildMarket({ market: "Perth", score: 65, availableDrivers: 2, activeOrders: 3 }),
+      ]);
+      store.updateDrivers([
+        buildDriver({
+          driverId: "offline@test.com",
+          name: "Offline Dan",
+          isOnline: false,
+          activeOrdersCount: 1,
+        }),
       ]);
 
       const events = detector.detect(store);
-      expect(events.length).toBeGreaterThanOrEqual(3);
+      expect(events.length).toBeGreaterThanOrEqual(2);
 
-      // Check ordering
-      expect(events[0].priority).toBe("critical"); // driver offline
-      expect(events[1].priority).toBe("high"); // unassigned order
-      expect(events[2].priority).toBe("normal"); // market warning
+      // High priority should come before normal
+      const highIdx = events.findIndex((e) => e.priority === "high");
+      const normalIdx = events.findIndex((e) => e.priority === "normal");
+      expect(highIdx).toBeLessThan(normalIdx);
     });
   });
 });

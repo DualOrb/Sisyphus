@@ -442,8 +442,8 @@ describe("Transformers", () => {
       expect(driver.status).toBe("Offline");
     });
 
-    it("computes status = Offline when ConnectionId is null", () => {
-      const driver = transformDriver(makeRawDriver({ ConnectionId: null }));
+    it("computes status = Offline when not Available and not OnShift", () => {
+      const driver = transformDriver(makeRawDriver({ Available: false, OnShift: false, ConnectionId: null }));
       expect(driver.isOnline).toBe(false);
       expect(driver.status).toBe("Offline");
     });

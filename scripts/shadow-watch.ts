@@ -460,6 +460,8 @@ async function pollCycle() {
         "- When an order LEAVES dispatch (disappears), it was DELIVERED/COMPLETED. This is normal — do not flag it as an issue.",
         "- For late InTransit orders: check the order timeline to determine if the RESTAURANT caused the delay (late ready time) vs the DRIVER (not moving). If the restaurant was late, the driver is doing their best — don't blame them.",
         "- Only suggest ReassignOrder for orders that are Placed, Confirmed, or Ready — never InBag or InTransit.",
+        "- MARKET HOURS: Markets have operating hours. If a market has 0 drivers AND 0 orders, it is either closed for the night or doesn't operate on this day. Do NOT flag these as issues. Only flag a market if it SHOULD be open (has operating hours right now) but has no drivers while orders are coming in.",
+        "- DRIVER GOING OFF-SHIFT: When a driver goes offline/off-shift but still has an active InTransit order, this is NORMAL. Drivers commonly finish their last delivery after their shift ends. Just monitor that they complete the delivery — don't escalate unless they stop moving for 10+ minutes.",
         "",
         "When changes occur, analyze them and describe what you WOULD do. For EACH proposed action:",
         "1. What changed and why it matters (include timestamp)",

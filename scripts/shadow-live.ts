@@ -927,6 +927,13 @@ async function pollCycle(infra: Awaited<ReturnType<typeof initialize>>) {
     ontologyStore.updateOrders(orders);
     ontologyStore.updateDrivers(drivers);
     ontologyStore.updateMarkets(markets);
+
+    // 3. Cross-reference: compute activeOrdersCount per driver
+    for (const driver of ontologyStore.queryDrivers({})) {
+      const driverOrders = ontologyStore.queryOrders({ driverId: driver.driverId });
+      (driver as any).activeOrdersCount = driverOrders.length;
+    }
+
     ontologyStore.markSynced();
 
     // 3. Detect specific changes (raw dispatch data diff)

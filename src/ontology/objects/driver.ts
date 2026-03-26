@@ -35,6 +35,8 @@ export const DriverSchema = z.object({
   name: z.string().describe("DynamoDB: FullName"),
   /** Phone number */
   phone: z.string().describe("DynamoDB: Phone"),
+  /** Short codename used on dispatch board (e.g. "RG", "AGA", "MH") */
+  monacher: z.string().optional().describe("DynamoDB: Monacher — dispatch board short name"),
   /** Internal UUID reference */
   agentId: z.string().uuid().optional().describe("DynamoDB: AgentId"),
 
