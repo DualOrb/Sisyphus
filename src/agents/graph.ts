@@ -20,7 +20,8 @@
  */
 
 import { StateGraph, START, END, MemorySaver } from "@langchain/langgraph";
-import type { DynamicStructuredTool } from "@langchain/core/tools";
+import { DynamicStructuredTool } from "@langchain/core/tools";
+import { z } from "zod";
 import type { Redis as RedisClient } from "ioredis";
 import type { BaseCheckpointSaver } from "@langchain/langgraph-checkpoint";
 
@@ -51,10 +52,17 @@ import {
   TASK_EXECUTOR_NAME,
 } from "./task-executor/agent.js";
 import { createOntologyTools } from "../tools/ontology-tools.js";
+import { createProcessTools } from "../tools/process-tools.js";
 import {
   loadProcessDirectory,
   buildSystemPrompt,
+  selectRelevantProcesses,
+  type ProcessSelectionContext,
 } from "../tools/process-loader.js";
+import { executeAction } from "../guardrails/executor.js";
+import type { ExecutionContext, AuditRecord } from "../guardrails/types.js";
+import type { ShadowExecutor } from "../execution/shadow/executor.js";
+import type { ShadowMetrics } from "../execution/shadow/metrics.js";
 import type { OntologyStore } from "../ontology/state/index.js";
 import { createChildLogger } from "../lib/index.js";
 
@@ -90,6 +98,13 @@ function supervisorRouter(state: AgentStateType): string {
 // Graph factory
 // ---------------------------------------------------------------------------
 
+/**
+ * Callback invoked by the custom execute_action tool whenever an audit
+ * record is produced by the guardrails pipeline. Use this to wire
+ * PostgreSQL writes, shadow proposal tracking, or any other side channel.
+ */
+export type OnAuditCallback = (record: AuditRecord) => void | Promise<void>;
+
 export interface CreateDispatchGraphOptions {
   /**
    * Checkpoint saver for conversation persistence.
@@ -97,6 +112,39 @@ export interface CreateDispatchGraphOptions {
    * Pass a PostgresSaver for production use.
    */
   checkpointer?: BaseCheckpointSaver;
+
+  /**
+   * Optional audit callback wired into the execute_action tool.
+   * When provided, a custom execute_action tool is created that passes
+   * the OntologyStore (not a plain object) as state and invokes this
+   * callback on every audit record.
+   */
+  onAudit?: OnAuditCallback;
+
+  /**
+   * Optional ShadowExecutor instance. When provided together with
+   * onAudit, executed/staged actions also generate shadow proposals.
+   */
+  shadowExecutor?: ShadowExecutor;
+
+  /**
+   * Optional ShadowMetrics instance for tracking proposal statistics.
+   */
+  shadowMetrics?: ShadowMetrics;
+
+  /**
+   * Correlation / shift ID attached to the execution context.
+   * Defaults to a random UUID if not provided.
+   */
+  correlationId?: string;
+
+  /**
+   * Process selection context used by selectRelevantProcesses.
+   * When provided, the graph uses selectRelevantProcesses to build
+   * lean per-agent prompts instead of loading ALL process files.
+   * Agents can still fetch additional procedures via lookup_process.
+   */
+  processSelectionContext?: ProcessSelectionContext;
 }
 
 /**
@@ -105,7 +153,7 @@ export interface CreateDispatchGraphOptions {
  * @param store       The ontology state store (populated by sync layer).
  * @param redis       Redis client for cooldowns, timelines, action execution.
  * @param processDir  Path to the `processes/` directory containing .md files.
- * @param options     Optional overrides (checkpointer, etc.).
+ * @param options     Optional overrides (checkpointer, onAudit, shadow, etc.).
  * @returns The compiled LangGraph, ready to `.invoke()` or `.stream()`.
  */
 export async function createDispatchGraph(
@@ -114,6 +162,13 @@ export async function createDispatchGraph(
   processDir: string,
   options: CreateDispatchGraphOptions = {},
 ) {
+  const {
+    onAudit,
+    shadowExecutor,
+    correlationId,
+    processSelectionContext,
+  } = options;
+
   // -----------------------------------------------------------------------
   // 1. Load process files
   // -----------------------------------------------------------------------
@@ -122,22 +177,81 @@ export async function createDispatchGraph(
   const processes = await loadProcessDirectory(processDir);
   log.info({ count: processes.length }, "Process files loaded");
 
-  // Build system prompts for each agent role
-  const supervisorPrompt = buildSystemPrompt("supervisor", processes);
-  const marketMonitorPrompt = buildSystemPrompt("market-monitor", processes);
-  const driverCommsPrompt = buildSystemPrompt("driver-comms", processes);
-  const customerSupportPrompt = buildSystemPrompt("customer-support", processes);
-  const taskExecutorPrompt = buildSystemPrompt("task-executor", processes);
+  // -----------------------------------------------------------------------
+  // 1b. Build system prompts — use selectRelevantProcesses when a
+  //     context is provided (production), otherwise load ALL per agent.
+  // -----------------------------------------------------------------------
+
+  let supervisorPrompt: string;
+  let marketMonitorPrompt: string;
+  let driverCommsPrompt: string;
+  let customerSupportPrompt: string;
+  let taskExecutorPrompt: string;
+
+  if (processSelectionContext) {
+    // Production path: lean per-agent prompts using selectRelevantProcesses.
+    // Agents can still fetch additional procedures via the lookup_process tool.
+    const supervisorBase = selectRelevantProcesses(processes, "supervisor", processSelectionContext);
+    const marketMonitorBase = selectRelevantProcesses(processes, "market-monitor", processSelectionContext);
+    const driverCommsBase = selectRelevantProcesses(processes, "driver-comms", processSelectionContext);
+    const customerSupportBase = selectRelevantProcesses(processes, "customer-support", processSelectionContext);
+    const taskExecutorBase = selectRelevantProcesses(processes, "task-executor", processSelectionContext);
+
+    log.info(
+      {
+        supervisor: supervisorBase.length,
+        marketMonitor: marketMonitorBase.length,
+        driverComms: driverCommsBase.length,
+        customerSupport: customerSupportBase.length,
+        taskExecutor: taskExecutorBase.length,
+        totalLibrary: processes.length,
+      },
+      "Base process files selected per agent (full library available via lookup_process tool)",
+    );
+
+    supervisorPrompt = buildSystemPrompt("supervisor", supervisorBase);
+    marketMonitorPrompt = buildSystemPrompt("market-monitor", marketMonitorBase);
+    driverCommsPrompt = buildSystemPrompt("driver-comms", driverCommsBase);
+    customerSupportPrompt = buildSystemPrompt("customer-support", customerSupportBase);
+    taskExecutorPrompt = buildSystemPrompt("task-executor", taskExecutorBase);
+  } else {
+    // Dev path: load all process files per agent (original behaviour).
+    supervisorPrompt = buildSystemPrompt("supervisor", processes);
+    marketMonitorPrompt = buildSystemPrompt("market-monitor", processes);
+    driverCommsPrompt = buildSystemPrompt("driver-comms", processes);
+    customerSupportPrompt = buildSystemPrompt("customer-support", processes);
+    taskExecutorPrompt = buildSystemPrompt("task-executor", processes);
+  }
 
   // -----------------------------------------------------------------------
   // 2. Create ontology tools
   // -----------------------------------------------------------------------
 
-  const allTools: DynamicStructuredTool[] = createOntologyTools(
+  const baseTools: DynamicStructuredTool[] = createOntologyTools(
     store,
     redis,
     "sisyphus",
   );
+
+  // When an onAudit callback is provided, replace the default execute_action
+  // tool with one that passes the OntologyStore as state and wires the audit
+  // callback (same pattern as shadow-live.ts).
+  let allTools: DynamicStructuredTool[];
+  if (onAudit) {
+    allTools = baseTools.filter((t) => t.name !== "execute_action");
+    allTools.push(
+      createCustomExecuteActionTool(store, redis, "sisyphus", onAudit, {
+        correlationId,
+        shadowExecutor,
+      }),
+    );
+  } else {
+    allTools = baseTools;
+  }
+
+  // Add process retrieval tools — agents can search the full library on demand
+  const processTools = createProcessTools(processes);
+  allTools.push(...processTools);
 
   // -----------------------------------------------------------------------
   // 3. Create LLM instances
@@ -221,7 +335,131 @@ export async function createDispatchGraph(
 
   const compiled = graph.compile({ checkpointer });
 
-  log.info("Dispatch graph compiled successfully");
+  log.info(
+    onAudit ? "Dispatch graph compiled with custom audit tools" : "Dispatch graph compiled successfully",
+  );
 
   return compiled;
+}
+
+// ---------------------------------------------------------------------------
+// Custom execute_action tool with caller-provided audit callback
+// ---------------------------------------------------------------------------
+
+/**
+ * Infer entity type from an action name (e.g. "AssignDriverToOrder" -> "order").
+ */
+export function guessEntityType(actionType: string): string {
+  if (actionType.includes("Order") || actionType.includes("Assign") || actionType.includes("Reassign"))
+    return "order";
+  if (actionType.includes("Driver") || actionType.includes("FollowUp"))
+    return "driver";
+  if (actionType.includes("Ticket") || actionType.includes("Escalate"))
+    return "ticket";
+  if (actionType.includes("Market")) return "market";
+  return "unknown";
+}
+
+/**
+ * Best-effort extraction of the primary entity ID from action params.
+ */
+export function guessEntityId(params: Record<string, unknown>): string {
+  return (
+    (params.orderId as string) ??
+    (params.order_id as string) ??
+    (params.driverId as string) ??
+    (params.driver_id as string) ??
+    (params.ticketId as string) ??
+    (params.ticket_id as string) ??
+    (params.market as string) ??
+    "unknown"
+  );
+}
+
+/**
+ * Build a custom `execute_action` tool that:
+ * - Passes the OntologyStore (as-is) to the execution context
+ * - Invokes the caller-supplied `onAudit` callback
+ * - Optionally records shadow proposals via ShadowExecutor
+ *
+ * This mirrors what shadow-live.ts does, but lives in core so both the
+ * production init system and shadow-live can share the same logic.
+ */
+function createCustomExecuteActionTool(
+  store: OntologyStore,
+  redis: RedisClient,
+  agentId: string,
+  onAudit: OnAuditCallback,
+  extra: {
+    correlationId?: string;
+    shadowExecutor?: ShadowExecutor;
+  } = {},
+): DynamicStructuredTool {
+  return new DynamicStructuredTool({
+    name: "execute_action",
+    description:
+      "Execute a named action through the ontology guardrails pipeline. The action will be " +
+      "validated against submission criteria, checked for cooldowns and rate limits, and " +
+      "executed according to its autonomy tier (GREEN/YELLOW auto-execute, ORANGE staged " +
+      "for review, RED requires human approval). ALWAYS provide a clear reasoning string " +
+      "explaining why you chose this action — it is logged to the audit trail.\n\n" +
+      "Available actions include: AssignDriverToOrder, ReassignOrder, UpdateOrderStatus, " +
+      "CancelOrder, SendDriverMessage, FollowUpWithDriver, ResolveTicket, EscalateTicket, " +
+      "AddTicketNote, FlagMarketIssue, and more.",
+    schema: z.object({
+      actionName: z
+        .string()
+        .describe("The registered action name (e.g. 'SendDriverMessage', 'ReassignOrder')"),
+      params: z
+        .record(z.unknown())
+        .describe("Action parameters as a JSON object (varies by action type)"),
+      reasoning: z
+        .string()
+        .describe("Your explanation of why you are taking this action. This is logged to the audit trail."),
+    }),
+    func: async (input) => {
+      try {
+        const executionContext: ExecutionContext = {
+          redis,
+          state: store as unknown as Record<string, unknown>,
+          correlationId: extra.correlationId,
+          llmModel: process.env.LLM_MODEL ?? "unknown",
+          llmTokensUsed: 0,
+          onAudit: async (record: AuditRecord) => {
+            // 1. Invoke the caller-provided audit callback
+            await onAudit(record);
+
+            // 2. Record shadow proposal for executed/staged actions
+            if (extra.shadowExecutor && (record.outcome === "executed" || record.outcome === "staged")) {
+              extra.shadowExecutor.setContext({
+                tier: "YELLOW",
+                reasoning: record.reasoning,
+                agentId: record.agentId,
+                validationResult: {
+                  passed: true,
+                },
+              });
+              await extra.shadowExecutor.execute(record.actionType, record.params);
+            }
+          },
+        };
+
+        const result = await executeAction(
+          input.actionName,
+          input.params,
+          input.reasoning,
+          agentId,
+          executionContext,
+        );
+
+        return JSON.stringify(result);
+      } catch (err) {
+        log.error({ err, input }, "execute_action failed");
+        return JSON.stringify({
+          error: "Failed to execute action",
+          details: String(err),
+        });
+      }
+    },
+  });
 }

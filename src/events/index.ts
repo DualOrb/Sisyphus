@@ -28,4 +28,10 @@ export { EventDispatcher } from "./dispatcher.js";
 
 // Cycle
 export { DispatchCycle } from "./cycle.js";
-export type { CycleResult, DispatchGraph } from "./cycle.js";
+export type {
+  CycleResult,
+  DispatchGraph,
+  DispatchCycleConfig,
+  ChangeDetail,
+  Changes,
+} from "./cycle.js";

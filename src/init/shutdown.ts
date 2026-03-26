@@ -4,6 +4,9 @@
  * Tears down all connections and services in reverse order of initialization.
  * Each step has independent error handling so one failure does not prevent
  * the rest of the cleanup from running.
+ *
+ * Also generates a shift report from accumulated shadow metrics and audit
+ * records (same data that shadow-live.ts writes on SIGINT).
  */
 
 import type { SisyphusConnections } from "./connections.js";
@@ -20,7 +23,7 @@ const log = createChildLogger("init:shutdown");
  *
  * @param connections - Active connections to tear down
  * @param services - Active services to stop
- * @param healthServer - Optional HTTP health server to close
+ * @param healthServer - Optional HTTP health server to close (deprecated — use services.healthServer)
  */
 export async function shutdownSisyphus(
   connections: SisyphusConnections,
@@ -28,6 +31,45 @@ export async function shutdownSisyphus(
   healthServer?: http.Server,
 ): Promise<void> {
   log.info("Starting Sisyphus graceful shutdown...");
+
+  // ---- 0. Generate shift report (non-fatal) --------------------------------
+  try {
+    const metrics = services.shadowMetrics.getSummary();
+    const proposals = services.shadowExecutor.getProposals();
+    const auditRecords = services.auditRecords;
+
+    log.info(
+      {
+        shiftId: services.shiftId,
+        totalProposals: metrics.totalProposals,
+        totalAuditRecords: auditRecords.length,
+        byAction: metrics.byAction,
+        byTier: metrics.byTier,
+        byValidation: metrics.byValidation,
+        byAgent: metrics.byAgent,
+        byMethod: metrics.byMethod,
+      },
+      "Shift report — shadow metrics summary",
+    );
+
+    if (proposals.length > 0) {
+      log.info({ count: proposals.length }, "Shift report — all proposals");
+      for (const p of proposals) {
+        log.info(
+          {
+            timestamp: p.timestamp.toISOString(),
+            actionName: p.actionName,
+            tier: p.tier,
+            wouldExecuteVia: p.wouldExecuteVia,
+            reasoning: p.reasoning ?? "n/a",
+          },
+          "Shift proposal",
+        );
+      }
+    }
+  } catch (err) {
+    log.error({ err }, "Error generating shift report");
+  }
 
   // ---- 1. Stop syncer polling ----------------------------------------------
   try {
@@ -82,11 +124,13 @@ export async function shutdownSisyphus(
   }
 
   // ---- 6. Stop health server -----------------------------------------------
+  // Support both the legacy `healthServer` parameter and the services-managed one.
+  const server = healthServer ?? services.healthServer;
   try {
-    if (healthServer) {
+    if (server) {
       log.info("Stopping health server");
       await new Promise<void>((resolve, reject) => {
-        healthServer.close((err) => {
+        server.close((err) => {
           if (err) reject(err);
           else resolve();
         });

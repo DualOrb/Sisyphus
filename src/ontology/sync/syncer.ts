@@ -272,6 +272,146 @@ export class OntologySyncer {
     }
   }
 
+  // ---- dispatch.txt-based sync -----------------------------------------------
+
+  /**
+   * Sync the store from an already-parsed dispatch.txt JSON payload.
+   *
+   * dispatch.txt is the S3 file that the dispatch UI reads. Its structure is:
+   *
+   *   {
+   *     "Timestamp": 1234567890,
+   *     "ZoneName1": { Drivers: [...], Orders: [...], Meter: {...} },
+   *     "ZoneName2": { ... },
+   *     ...
+   *   }
+   *
+   * This method parses all zones, transforms entities, and updates the store.
+   * The caller is responsible for fetching the file from S3 (or elsewhere).
+   *
+   * @param data  Parsed dispatch.txt JSON (the full object).
+   * @param excludeRestaurants  Optional set of restaurant IDs to skip.
+   */
+  syncFromDispatchFile(
+    data: Record<string, any>,
+    excludeRestaurants?: Set<string>,
+  ): void {
+    if (this._isSyncing) {
+      this.log.debug("Sync already in progress, skipping dispatch file sync");
+      return;
+    }
+
+    this._isSyncing = true;
+    const startMs = Date.now();
+
+    try {
+      const zones = Object.keys(data).filter((k) => k !== "Timestamp");
+
+      const orders: ReturnType<typeof transformOrder>[] = [];
+      const drivers: ReturnType<typeof transformDriver>[] = [];
+      const markets: ReturnType<typeof transformMarket>[] = [];
+
+      for (const zone of zones) {
+        const zoneData = data[zone];
+
+        // Drivers
+        if (zoneData?.Drivers) {
+          for (const d of zoneData.Drivers) {
+            try {
+              drivers.push(
+                transformDriver({
+                  ...d,
+                  DispatchZone: d.DispatchZone ?? zone,
+                  DeliveryArea: d.DeliveryArea ?? zone,
+                  Active: d.Active ?? true,
+                }),
+              );
+            } catch {
+              /* skip bad records */
+            }
+          }
+        }
+
+        // Orders
+        if (zoneData?.Orders) {
+          for (const o of zoneData.Orders) {
+            if (excludeRestaurants?.has(o.RestaurantId)) continue;
+            try {
+              orders.push(
+                transformOrder({
+                  ...o,
+                  DeliveryZone: o.DeliveryZone ?? zone,
+                }),
+              );
+            } catch {
+              /* skip bad records */
+            }
+          }
+        }
+
+        // Markets (from Meter)
+        if (zoneData?.Meter) {
+          try {
+            markets.push(
+              transformMarket({
+                Market: zone,
+                ...zoneData.Meter,
+              }),
+            );
+          } catch {
+            /* skip */
+          }
+        }
+      }
+
+      // Update the store
+      this.store.updateOrders(orders);
+      this.store.updateDrivers(drivers);
+      this.store.updateMarkets(markets);
+
+      // Enrich cross-entity computed fields
+      this.enrichDriverOrderCounts();
+      this.enrichRestaurantLoad();
+      this.enrichMarketActiveOrders();
+
+      this.store.markSynced();
+
+      const durationMs = Date.now() - startMs;
+      const stats = this.store.getStats();
+      this.log.info(
+        {
+          durationMs,
+          orders: stats.orders,
+          drivers: stats.drivers,
+          markets: stats.markets,
+          source: "dispatch.txt",
+        },
+        `Dispatch file sync completed in ${durationMs}ms`,
+      );
+    } catch (err) {
+      const durationMs = Date.now() - startMs;
+      this.log.error(
+        { err, durationMs },
+        `Dispatch file sync failed after ${durationMs}ms`,
+      );
+    } finally {
+      this._isSyncing = false;
+    }
+  }
+
+  /**
+   * Sync tickets from pre-transformed ticket objects into the store.
+   *
+   * This is used when tickets come from DynamoDB (fetched externally)
+   * rather than via the adapter's fetchIssues method.
+   *
+   * @param tickets  Array of already-transformed Ticket objects.
+   */
+  syncTickets(tickets: ReturnType<typeof transformTicket>[]): void {
+    this.store.updateTickets(tickets);
+    this.log.info({ count: tickets.length }, "Tickets synced into store");
+  }
+
   // ---- Private helpers ------------------------------------------------------
 
   /**

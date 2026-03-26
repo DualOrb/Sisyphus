@@ -9,10 +9,15 @@
  * or per-activity connection creation is needed.
  */
 
+import { S3Client, GetObjectCommand } from "@aws-sdk/client-s3";
+import { DynamoDBClient, QueryCommand } from "@aws-sdk/client-dynamodb";
+import { unmarshall } from "@aws-sdk/util-dynamodb";
+
 import { createChildLogger } from "../lib/logger.js";
 import { env } from "../config/env.js";
 import { connectBrowser, createDispatchPage, disconnectBrowser as doDisconnectBrowser } from "../execution/browser/connection.js";
 import { writeShiftSummary as dbWriteShiftSummary } from "../memory/postgres/queries.js";
+import { transformTicket } from "../ontology/sync/transformer.js";
 
 import type { SisyphusConnections } from "../init/connections.js";
 import type { SisyphusServices } from "../init/services.js";
@@ -44,6 +49,12 @@ let shiftStats: ShiftStats = {
   errorsEncountered: 0,
   browserReconnections: 0,
 };
+
+/**
+ * Latest parsed dispatch.txt data from S3, stored between activities so
+ * runDispatchCycle can pass it to DispatchCycle.run() for change detection.
+ */
+let latestDispatchData: any = null;
 
 /** Reset stats at the beginning of a new shift. */
 export function resetShiftStats(): void {
@@ -189,6 +200,101 @@ export function createActivities(connections: SisyphusConnections, services: Sis
   }
 
   // -------------------------------------------------------------------------
+  // syncOntologyFromS3
+  // -------------------------------------------------------------------------
+
+  /**
+   * Sync the ontology from dispatch.txt in S3 and tickets from DynamoDB.
+   *
+   * This mirrors what shadow-live.ts does:
+   * 1. Fetch dispatch.txt from the S3 bucket
+   * 2. Parse and sync orders, drivers, markets into the store
+   * 3. Fetch relevant tickets from DynamoDB IssueTracker table
+   * 4. Sync tickets into the store
+   *
+   * Falls back to the adapter-based sync if S3 fetch fails.
+   */
+  async function syncOntologyFromS3(): Promise<boolean> {
+    log.info("Running ontology sync from dispatch.txt (S3)");
+
+    const region = process.env.AWS_REGION ?? "us-east-1";
+    const bucket = process.env.DISPATCH_S3_BUCKET ?? "valleyeats";
+    const key = process.env.DISPATCH_S3_KEY ?? "dispatch.txt";
+    const sisyphusEmail = process.env.DISPATCH_USERNAME ?? "sisyphus@valleyeats.ca";
+
+    try {
+      // 1. Fetch dispatch.txt from S3
+      const s3 = new S3Client({ region });
+      const s3Result = await s3.send(
+        new GetObjectCommand({ Bucket: bucket, Key: key }),
+      );
+      const body = await s3Result.Body?.transformToString();
+      if (!body) throw new Error("Empty dispatch.txt from S3");
+      const data = JSON.parse(body);
+
+      // 2. Sync into the store via the syncer's dispatch file method
+      services.syncer.syncFromDispatchFile(data);
+
+      // 2b. Store the raw dispatch data so runDispatchCycle can use it
+      latestDispatchData = data;
+
+      // 3. Fetch relevant tickets from DynamoDB
+      try {
+        const dynamo = new DynamoDBClient({ region });
+        const tickets: ReturnType<typeof transformTicket>[] = [];
+
+        for (const status of ["New", "Pending", "Awaiting Response"]) {
+          try {
+            const result = await dynamo.send(
+              new QueryCommand({
+                TableName: "ValleyEats-IssueTracker",
+                IndexName: "IssueStatus-Created-index",
+                KeyConditionExpression: "IssueStatus = :s",
+                ExpressionAttributeValues: { ":s": { S: status } },
+                Limit: 50,
+                ScanIndexForward: false,
+              }),
+            );
+            if (result.Items) {
+              for (const item of result.Items) {
+                try {
+                  const ticket = transformTicket(unmarshall(item));
+                  if (ticket.owner === "Unassigned" || ticket.owner === sisyphusEmail) {
+                    tickets.push(ticket);
+                  }
+                } catch {
+                  /* skip bad records */
+                }
+              }
+            }
+          } catch (err) {
+            log.warn({ err, status }, "Failed to query DynamoDB tickets for status");
+          }
+        }
+
+        if (tickets.length > 0) {
+          services.syncer.syncTickets(tickets);
+          log.info({ count: tickets.length }, "Tickets synced from DynamoDB");
+        }
+      } catch (err) {
+        log.warn({ err }, "Ticket sync from DynamoDB failed — continuing with stale ticket data");
+      }
+
+      shiftStats.ontologySyncs++;
+      const stats = services.store.getStats();
+      log.info(
+        { totalSyncs: shiftStats.ontologySyncs, ...stats },
+        "Ontology sync from S3 completed",
+      );
+      return true;
+    } catch (err) {
+      log.warn({ err }, "S3-based sync failed — falling back to adapter sync");
+      // Fall back to adapter-based sync
+      return syncOntology();
+    }
+  }
+
+  // -------------------------------------------------------------------------
   // runDispatchCycle
   // -------------------------------------------------------------------------
 
@@ -203,7 +309,7 @@ export function createActivities(connections: SisyphusConnections, services: Sis
     log.info("Running dispatch cycle");
 
     try {
-      const result = await services.dispatchCycle.run();
+      const result = await services.dispatchCycle.run(latestDispatchData);
 
       shiftStats.dispatchCycles++;
       shiftStats.actionsExecuted += result.eventsProcessed;
@@ -214,6 +320,8 @@ export function createActivities(connections: SisyphusConnections, services: Sis
           eventsProcessed: result.eventsProcessed,
           graphInvoked: result.graphInvoked,
           durationMs: result.duration,
+          reason: result.reason,
+          changesDetected: result.changesDetected,
         },
         "Dispatch cycle completed",
       );
@@ -358,6 +466,58 @@ export function createActivities(connections: SisyphusConnections, services: Sis
   }
 
   // -------------------------------------------------------------------------
+  // generateAndWriteShiftReport
+  // -------------------------------------------------------------------------
+
+  /**
+   * Generate a shift report from accumulated shadow metrics and audit records.
+   *
+   * Uses the ShadowMetrics and ShadowExecutor from the services to build a
+   * comprehensive shift report, mirroring shadow-live.ts's SIGINT handler.
+   */
+  async function generateAndWriteShiftReport(): Promise<boolean> {
+    log.info("Generating shift report");
+
+    try {
+      const metrics = services.shadowMetrics.getSummary();
+      const proposals = services.shadowExecutor.getProposals();
+
+      log.info(
+        {
+          totalProposals: metrics.totalProposals,
+          byAction: metrics.byAction,
+          byTier: metrics.byTier,
+          shiftId: services.shiftId,
+        },
+        "Shift report — shadow metrics summary",
+      );
+
+      if (proposals.length > 0) {
+        log.info(
+          { count: proposals.length },
+          "Shift report — proposals logged",
+        );
+        for (const p of proposals) {
+          log.debug(
+            {
+              actionName: p.actionName,
+              tier: p.tier,
+              wouldExecuteVia: p.wouldExecuteVia,
+              reasoning: p.reasoning,
+            },
+            "Proposal detail",
+          );
+        }
+      }
+
+      return true;
+    } catch (err) {
+      log.error({ err }, "Failed to generate shift report");
+      return false;
+    }
+  }
+
+  // -------------------------------------------------------------------------
   // Return all activities
   // -------------------------------------------------------------------------
 
@@ -365,11 +525,13 @@ export function createActivities(connections: SisyphusConnections, services: Sis
     startBrowser,
     authenticateDispatch,
     syncOntology,
+    syncOntologyFromS3,
     runDispatchCycle,
     writeShiftSummary,
     disconnectBrowser,
     isWithinBusinessHours,
     getShiftStats,
+    generateAndWriteShiftReport,
   };
 }
 
