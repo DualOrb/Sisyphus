@@ -147,10 +147,13 @@ async function fetchDispatchFile(): Promise<any> {
 // DynamoDB: fetch open tickets from IssueTracker
 // ---------------------------------------------------------------------------
 
-async function fetchOpenTickets(): Promise<any[]> {
+const SISYPHUS_EMAIL = process.env.DISPATCH_USERNAME ?? "sisyphus@valleyeats.ca";
+
+async function fetchRelevantTickets(): Promise<any[]> {
   const tickets: any[] = [];
 
-  for (const status of ["New", "Pending"]) {
+  // Query New, Pending, and Awaiting Response — same as dispatch page
+  for (const status of ["New", "Pending", "Awaiting Response"]) {
     try {
       const result = await dynamo.send(
         new QueryCommand({
@@ -165,7 +168,11 @@ async function fetchOpenTickets(): Promise<any[]> {
       if (result.Items) {
         for (const item of result.Items) {
           try {
-            tickets.push(transformTicket(unmarshall(item)));
+            const ticket = transformTicket(unmarshall(item));
+            // Only keep tickets that are unassigned or assigned to Sisyphus
+            if (ticket.owner === "Unassigned" || ticket.owner === SISYPHUS_EMAIL) {
+              tickets.push(ticket);
+            }
           } catch { /* skip bad records */ }
         }
       }
@@ -970,7 +977,7 @@ async function pollCycle(infra: Awaited<ReturnType<typeof initialize>>) {
     // 2b. Sync tickets from DynamoDB every 3rd cycle (~60s) or on first cycle
     if (isFirstCycle || cycleCount % 3 === 0) {
       try {
-        const tickets = await fetchOpenTickets();
+        const tickets = await fetchRelevantTickets();
         ontologyStore.updateTickets(tickets);
         if (tickets.length > 0) {
           logConsole(`  [${now()}] Synced ${tickets.length} open ticket(s) from DynamoDB`);

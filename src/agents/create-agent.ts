@@ -17,10 +17,10 @@
  */
 
 import { ChatOpenAI } from "@langchain/openai";
-import { ToolNode } from "@langchain/langgraph/prebuilt";
 import {
   AIMessage,
   SystemMessage,
+  ToolMessage,
   type BaseMessage,
 } from "@langchain/core/messages";
 import type { DynamicStructuredTool } from "@langchain/core/tools";
@@ -69,8 +69,8 @@ export function createAgentNode(
   const modelWithTools =
     tools.length > 0 ? model.bindTools(tools) : model;
 
-  // ToolNode handles executing tool calls from AIMessages
-  const toolNode = new ToolNode(tools);
+  // Build a lookup map for tools by name
+  const toolMap = new Map(tools.map((t) => [t.name, t]));
 
   return async (state: AgentStateType): Promise<AgentStateUpdate> => {
     log.info({ agent: name, task: state.currentTask }, "Agent invoked");
@@ -105,24 +105,34 @@ export function createAgentNode(
         break;
       }
 
-      // Execute all requested tool calls via ToolNode
-      const toolResult = await toolNode.invoke({
-        messages: [...currentMessages, response],
-      });
+      // Execute each tool call and create matching ToolMessages
+      // (must match 1:1 — providers like Anthropic/Vertex require every
+      // tool_use to have a corresponding tool_result)
+      const toolResponses: BaseMessage[] = [];
 
-      // toolResult.messages contains ToolMessage responses
-      const toolMessages: BaseMessage[] = toolResult.messages ?? [];
+      for (const tc of toolCalls) {
+        const tool = toolMap.get(tc.name);
+        let content: string;
 
-      // Only keep the new ToolMessages (the ones after our input)
-      const newToolMessages = toolMessages.slice(currentMessages.length + 1);
-      newMessages.push(...newToolMessages);
+        if (tool) {
+          try {
+            const result = await (tool as any).invoke(tc.args);
+            content = typeof result === "string" ? result : JSON.stringify(result);
+          } catch (err: any) {
+            content = JSON.stringify({ error: err.message ?? "Tool execution failed" });
+          }
+        } else {
+          content = JSON.stringify({ error: `Unknown tool: ${tc.name}` });
+        }
 
-      // Check for escalation signals in tool responses
-      for (const toolMsg of newToolMessages) {
-        const content =
-          typeof toolMsg.content === "string" ? toolMsg.content : "";
+        toolResponses.push(new ToolMessage({
+          content,
+          tool_call_id: tc.id ?? tc.name,
+          name: tc.name,
+        }));
+
+        // Check for escalation signals
         if (content.includes('"status":"pending"') && content.includes('"requestId"')) {
-          // A request_clarification tool was called — flag escalation
           needsEscalation = true;
           try {
             const parsed = JSON.parse(content) as { question?: string };
@@ -133,8 +143,8 @@ export function createAgentNode(
         }
       }
 
-      // Prepare messages for next iteration (append new messages)
-      currentMessages = [...currentMessages, response, ...newToolMessages];
+      newMessages.push(...toolResponses);
+      currentMessages = [...currentMessages, response, ...toolResponses];
     }
 
     if (iterations >= maxIterations) {
