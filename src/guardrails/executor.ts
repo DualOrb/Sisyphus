@@ -18,6 +18,7 @@
  */
 
 import { randomUUID } from "node:crypto";
+import { startActiveObservation } from "@langfuse/tracing";
 import { getAction } from "./registry.js";
 import { validateSubmissionCriteria } from "./validator.js";
 import { checkCooldown, setCooldown } from "./cooldown.js";
@@ -115,6 +116,18 @@ function shouldAutoExecute(tier: Tier): boolean {
 // ---------------------------------------------------------------------------
 
 export async function executeAction(
+  name: string,
+  params: Record<string, unknown>,
+  reasoning: string,
+  agentId: string,
+  context: ExecutionContext,
+): Promise<ActionResult> {
+  return startActiveObservation(`executeAction:${name}`, async () => {
+    return _executeAction(name, params, reasoning, agentId, context);
+  });
+}
+
+async function _executeAction(
   name: string,
   params: Record<string, unknown>,
   reasoning: string,

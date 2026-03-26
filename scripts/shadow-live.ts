@@ -12,6 +12,8 @@
  */
 
 import "dotenv/config";
+// OTel + Langfuse must initialise before any LangChain imports
+import "../src/instrumentation.js";
 import { mkdirSync, appendFileSync, writeFileSync } from "node:fs";
 import { resolve } from "node:path";
 import { randomUUID } from "node:crypto";
@@ -231,6 +233,8 @@ async function main() {
     eventQueue: new EventQueue(),
     messageListener: null,
     redis,
+    shiftId: sessionId,
+    operatingMode: "shadow",
   });
 
   // ---- Health server ----

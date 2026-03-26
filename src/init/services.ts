@@ -321,6 +321,8 @@ export async function initializeServices(
     messageListener,
     redis: connections.redis,
     shiftHandoff,
+    shiftId,
+    operatingMode: envVars.OPERATING_MODE,
   });
   log.info("DispatchCycle created");
 

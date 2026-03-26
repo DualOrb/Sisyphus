@@ -18,6 +18,8 @@
 
 import { HumanMessage, AIMessage } from "@langchain/core/messages";
 import type { Redis as RedisClient } from "ioredis";
+import { CallbackHandler } from "@langfuse/langchain";
+import { propagateAttributes } from "@langfuse/tracing";
 
 import type { OntologyStore } from "../ontology/state/store.js";
 import type { MessageListener } from "../execution/websocket/message-listener.js";
@@ -108,6 +110,10 @@ export interface DispatchCycleConfig {
   llmCooldownMs?: number;
   /** Previous shift handoff data for cross-shift awareness (first cycle only). */
   shiftHandoff?: { notes?: string | null; issues?: unknown; escalations?: number | null } | null;
+  /** Shift-scoped ID for trace grouping and correlation. */
+  shiftId?: string;
+  /** Operating mode tag for trace filtering (shadow, supervised, autonomous). */
+  operatingMode?: string;
 }
 
 // ---------------------------------------------------------------------------
@@ -125,6 +131,8 @@ export class DispatchCycle {
   private readonly heartbeatIntervalMs: number;
   private readonly llmCooldownMs: number;
   private readonly shiftHandoff: DispatchCycleConfig["shiftHandoff"];
+  private readonly shiftId: string;
+  private readonly operatingMode: string;
 
   // -- State maintained between run() calls --
   private previousDispatchData: any = null;
@@ -156,6 +164,8 @@ export class DispatchCycle {
     this.heartbeatIntervalMs = config.heartbeatIntervalMs ?? DEFAULT_HEARTBEAT_INTERVAL_MS;
     this.llmCooldownMs = config.llmCooldownMs ?? DEFAULT_LLM_COOLDOWN_MS;
     this.shiftHandoff = config.shiftHandoff ?? null;
+    this.shiftId = config.shiftId ?? "unknown";
+    this.operatingMode = config.operatingMode ?? "shadow";
   }
 
   // =========================================================================
@@ -364,11 +374,30 @@ export class DispatchCycle {
     let graphInvoked = false;
 
     const cycleThreadId = `cycle-${this.cycleCount}-${Date.now()}`;
+    const langfuseHandler = new CallbackHandler();
 
     try {
-      const result = await this.graph.invoke(
-        { messages: [new HumanMessage(combinedPrompt)] },
-        { configurable: { thread_id: cycleThreadId } },
+      const result = await propagateAttributes(
+        {
+          traceName: `Cycle #${this.cycleCount} - ${reason}`,
+          sessionId: `shift-${this.shiftId}`,
+          tags: ["dispatch-cycle", reason, this.operatingMode],
+          metadata: {
+            cycleNumber: String(this.cycleCount),
+            shiftId: this.shiftId,
+            reason,
+            changesDetected: String(changes.details.length),
+            operatingMode: this.operatingMode,
+          },
+        },
+        () =>
+          this.graph.invoke(
+            { messages: [new HumanMessage(combinedPrompt)] },
+            {
+              configurable: { thread_id: cycleThreadId },
+              callbacks: [langfuseHandler],
+            },
+          ),
       );
 
       graphInvoked = true;

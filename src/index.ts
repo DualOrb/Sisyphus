@@ -1,3 +1,6 @@
+// OTel + Langfuse must initialise before any LangChain imports
+import "./instrumentation.js";
+
 import { env } from "./config/index.js";
 import { logger } from "./lib/index.js";
 import { Connection, Client } from "@temporalio/client";

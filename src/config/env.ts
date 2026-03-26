@@ -44,8 +44,10 @@ const envSchema = z.object({
 
   // Observability
   LOG_LEVEL: z.enum(["trace", "debug", "info", "warn", "error", "fatal"]).default("info"),
-  LANGSMITH_API_KEY: z.string().optional(),
-  LANGSMITH_PROJECT: z.string().default("sisyphus"),
+  LANGFUSE_ENABLED: z.enum(["true", "false"]).default("false"),
+  LANGFUSE_SECRET_KEY: z.string().optional(),
+  LANGFUSE_PUBLIC_KEY: z.string().optional(),
+  LANGFUSE_BASE_URL: z.string().default("http://localhost:3100"),
 
   // Operating mode
   OPERATING_MODE: z.enum(["shadow", "supervised", "autonomous"]).default("shadow"),
