@@ -147,10 +147,12 @@ defineAction({
         const store = state as unknown as OntologyStore;
         const order = store.getOrder(params.orderId as string);
         if (!order) return { passed: false, message: "Order not found" };
-        if (["InTransit", "Completed", "Cancelled"].includes(order.status)) {
+        // Never reassign orders that are InBag, InTransit, Completed, or Cancelled.
+        // InBag = driver has the food; InTransit = driver is delivering.
+        if (["InBag", "InTransit", "Completed", "Cancelled"].includes(order.status)) {
           return {
             passed: false,
-            message: `Order is ${order.status} — cannot reassign`,
+            message: `Order is ${order.status} — cannot reassign (food is with driver or already terminal)`,
           };
         }
         return { passed: true };

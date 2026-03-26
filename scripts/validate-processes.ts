@@ -40,10 +40,10 @@ const c = {
 
 const KNOWN_AGENTS = new Set([
   "supervisor",
-  "market-monitor",
+  "market-monitor",  // legacy — process files may still reference this
   "driver-comms",
   "customer-support",
-  "task-executor",
+  "task-executor",   // legacy — process files may still reference this
   "all",
 ]);
 

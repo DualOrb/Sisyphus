@@ -3,11 +3,13 @@
  *
  * Each sub-agent is a node function that:
  *   1. Prepends its system prompt to the message history
- *   2. Calls the LLM (with tools bound)
- *   3. If the LLM requested tool calls, runs them via ToolNode
- *   4. Loops (call LLM / run tools) until the LLM produces a final
+ *   2. Injects the specific task assignment (from parallel dispatch via
+ *      `Send`) as a prominent system directive
+ *   3. Calls the LLM (with tools bound)
+ *   4. If the LLM requested tool calls, runs them via ToolNode
+ *   5. Loops (call LLM / run tools) until the LLM produces a final
  *      text response with no further tool calls
- *   5. Returns updated messages to merge into graph state
+ *   6. Returns updated messages to merge into graph state
  *
  * This is intentionally a "react-style" agent loop implemented inline
  * rather than using `createReactAgent`, so we retain full control over
@@ -35,6 +37,14 @@ const log = createChildLogger("create-agent");
 // Types
 // ---------------------------------------------------------------------------
 
+/** Callback for agent activity visibility. */
+export type AgentActivityCallback = (entry: {
+  agent: string;
+  type: "tool_call" | "tool_result" | "response" | "summary";
+  iteration: number;
+  content: string;
+}) => void;
+
 export interface AgentNodeConfig {
   /** Unique name used for logging and graph node identification. */
   name: string;
@@ -54,6 +64,8 @@ export interface AgentNodeConfig {
    * When provided, heartbeats are sent at the start and every 5 iterations.
    */
   redis?: RedisClient;
+  /** Optional callback for full visibility into agent activity. */
+  onActivity?: AgentActivityCallback;
 }
 
 // ---------------------------------------------------------------------------
@@ -70,7 +82,7 @@ export interface AgentNodeConfig {
 export function createAgentNode(
   config: AgentNodeConfig,
 ): (state: AgentStateType) => Promise<AgentStateUpdate> {
-  const { name, systemPrompt, tools, model, maxIterations = 10, redis } = config;
+  const { name, systemPrompt, tools, model, maxIterations = 10, redis, onActivity } = config;
 
   // Bind tools to the model so it knows what's available
   const modelWithTools =
@@ -80,7 +92,7 @@ export function createAgentNode(
   const toolMap = new Map(tools.map((t) => [t.name, t]));
 
   return async (state: AgentStateType): Promise<AgentStateUpdate> => {
-    log.info({ agent: name, task: state.currentTask }, "Agent invoked");
+    log.info({ agent: name, task: state.currentTask, taskType: state.currentTaskType }, "Agent invoked");
 
     // Send initial heartbeat
     if (redis) {
@@ -91,9 +103,30 @@ export function createAgentNode(
       }
     }
 
-    // Build the message list: system prompt + conversation history
+    // Build the message list: system prompt + task directive + conversation history.
+    // When dispatched via Send (parallel mode), each sub-agent receives a
+    // specific `currentTask` describing exactly what it should work on.
     const systemMsg = new SystemMessage(systemPrompt);
-    const inputMessages: BaseMessage[] = [systemMsg, ...state.messages];
+    const preambleMessages: BaseMessage[] = [systemMsg];
+
+    if (state.currentTask) {
+      preambleMessages.push(
+        new SystemMessage(
+          `## YOUR ASSIGNED TASK\n\n` +
+          `${state.currentTask}\n\n` +
+          `## INSTRUCTIONS\n\n` +
+          `The task above already contains all the data you need (order IDs, driver names, statuses, ready times, market info). ` +
+          `DO NOT call query_orders, query_drivers, query_restaurants, or query_tickets to re-read this data — it is already provided above.\n\n` +
+          `Only use tools for ACTIONS:\n` +
+          `- execute_action (SendDriverMessage, AddTicketNote, FlagMarketIssue, etc.)\n` +
+          `- get_ticket_details or get_order_details ONLY if you need info not in the task\n` +
+          `- lookup_process if you need a specific procedure\n\n` +
+          `Complete your task quickly: analyze the data, take action(s), then provide a brief summary. Do not investigate — act.`,
+        ),
+      );
+    }
+
+    const inputMessages: BaseMessage[] = [...preambleMessages, ...state.messages];
 
     const newMessages: BaseMessage[] = [];
     let iterations = 0;
@@ -145,7 +178,17 @@ export function createAgentNode(
 
       if (toolCalls.length === 0) {
         // No tool calls — agent is done
+        const text = typeof aiMsg.content === "string" ? aiMsg.content : JSON.stringify(aiMsg.content);
+        log.info({ agent: name, iteration: iterations }, "Agent final response (no tools)");
+        onActivity?.({ agent: name, type: "response", iteration: iterations, content: text });
         break;
+      }
+
+      // Log every tool call — full args, no truncation
+      for (const tc of toolCalls) {
+        const argsStr = JSON.stringify(tc.args);
+        log.info({ agent: name, iteration: iterations, tool: tc.name }, "Agent tool call: %s", tc.name);
+        onActivity?.({ agent: name, type: "tool_call", iteration: iterations, content: `${tc.name}(${argsStr})` });
       }
 
       // Execute each tool call and create matching ToolMessages
@@ -182,6 +225,8 @@ export function createAgentNode(
           name: tc.name,
         }));
 
+        onActivity?.({ agent: name, type: "tool_result", iteration: iterations, content: `${tc.name} → ${content}` });
+
         // Check for escalation signals
         if (content.includes('"status":"pending"') && content.includes('"requestId"')) {
           needsEscalation = true;
@@ -199,10 +244,13 @@ export function createAgentNode(
     }
 
     if (iterations >= maxIterations) {
-      log.warn(
-        { agent: name, iterations },
-        "Agent hit max iterations — forcing return",
-      );
+      log.warn({ agent: name, iterations }, "Agent hit max iterations — forcing return");
+      // Capture the last AI message as the summary — full content
+      const lastMsg = newMessages[newMessages.length - 1];
+      if (lastMsg) {
+        const text = typeof (lastMsg as any).content === "string" ? (lastMsg as any).content : "";
+        onActivity?.({ agent: name, type: "summary", iteration: iterations, content: text });
+      }
     }
 
     log.info(

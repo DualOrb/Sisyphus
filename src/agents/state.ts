@@ -2,8 +2,8 @@
  * Shared agent state definition for the Sisyphus dispatch graph.
  *
  * Uses LangGraph.js Annotation to define the state shape shared across
- * all agent nodes (supervisor, market monitor, driver comms, customer
- * support, task executor). The `messages` field uses the built-in
+ * all agent nodes (supervisor, driver comms, customer support).
+ * The `messages` field uses the built-in
  * message reducer that correctly handles append semantics and
  * RemoveMessage directives.
  *
@@ -12,6 +12,17 @@
 
 import type { BaseMessage } from "@langchain/core/messages";
 import { Annotation, messagesStateReducer } from "@langchain/langgraph";
+
+// ---------------------------------------------------------------------------
+// Task assignment type (used by parallel dispatch)
+// ---------------------------------------------------------------------------
+
+/** A single task assignment from the supervisor to a sub-agent. */
+export interface TaskAssignment {
+  agent: string;
+  task: string;
+  taskType: string;
+}
 
 // ---------------------------------------------------------------------------
 // Agent state annotation
@@ -24,7 +35,8 @@ import { Annotation, messagesStateReducer } from "@langchain/langgraph";
  *                       Uses the LangGraph messages reducer so nodes can
  *                       return a single message or array and it gets appended.
  * - `currentTask`     — Free-form description of the task the active agent
- *                       is working on (set by supervisor when delegating).
+ *                       is working on (set by supervisor when delegating,
+ *                       or set per-agent by Send in parallel dispatch).
  * - `currentTaskType` — Structured task category used for model routing
  *                       (e.g. "monitoring", "messaging", "ticket_resolution").
  * - `needsEscalation` — Flag set by a sub-agent to signal the supervisor
@@ -33,6 +45,11 @@ import { Annotation, messagesStateReducer } from "@langchain/langgraph";
  *                       requested (populated alongside needsEscalation).
  * - `nextAgent`       — Routing target decided by the supervisor. One of
  *                       the sub-agent node names or "__end__" to finish.
+ *                       Retained for backward compatibility; parallel
+ *                       dispatch uses `pendingTasks` instead.
+ * - `pendingTasks`    — Array of task assignments set by the supervisor.
+ *                       Each entry is dispatched as a parallel `Send` to
+ *                       the named sub-agent. Empty array means "done".
  */
 export const AgentState = Annotation.Root({
   messages: Annotation<BaseMessage[]>({
@@ -63,6 +80,11 @@ export const AgentState = Annotation.Root({
   nextAgent: Annotation<string>({
     reducer: (_prev, next) => next,
     default: () => "",
+  }),
+
+  pendingTasks: Annotation<TaskAssignment[]>({
+    reducer: (_prev, next) => next,
+    default: () => [],
   }),
 });
 

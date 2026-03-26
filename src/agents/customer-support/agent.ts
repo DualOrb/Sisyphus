@@ -23,7 +23,7 @@ import type { AgentStateType, AgentStateUpdate } from "../state.js";
 
 export const CUSTOMER_SUPPORT_NAME = "customer_support";
 
-const CUSTOMER_SUPPORT_PREAMBLE = `
+export const CUSTOMER_SUPPORT_PREAMBLE = `
 ## Your Role: Customer Support Agent
 
 You are the Customer Support agent for Sisyphus. You handle support tickets from open to resolution, including investigation, customer communication, and applying appropriate remedies.
@@ -63,7 +63,8 @@ Escalate to supervisor if:
 ### Important:
 - Customers come first — resolve issues quickly and empathetically.
 - Every resolution must include detailed reasoning in the audit trail.
-- Do NOT send driver messages or flag market issues — those are other agents' responsibilities.
+- Do NOT send driver messages directly — that is the driver_comms agent's responsibility. If a ticket requires driver contact, escalate that part.
+- You CAN handle restaurant admin tasks (pause, menu toggles) when discovered during ticket investigation.
 `;
 
 // ---------------------------------------------------------------------------

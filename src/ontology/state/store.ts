@@ -70,6 +70,7 @@ export class OntologyStore {
   readonly orders = new Map<string, Order>();
   readonly ordersByKey = new Map<string, Order>(); // OrderIdKey (8 chars) → Order
   readonly drivers = new Map<string, Driver>();
+  readonly driversByMonacher = new Map<string, Driver>(); // Monacher (short code) → Driver
   readonly restaurants = new Map<string, Restaurant>();
   readonly restaurantsByKey = new Map<string, Restaurant>(); // RestaurantIdKey (8 chars) → Restaurant
   readonly customers = new Map<string, Customer>();
@@ -86,8 +87,9 @@ export class OntologyStore {
     return this.orders.get(id) ?? this.ordersByKey.get(id);
   }
 
+  /** Get driver by email (driverId) OR monacher (short code like "DIK", "SJS") */
   getDriver(id: string): Driver | undefined {
-    return this.drivers.get(id);
+    return this.drivers.get(id) ?? this.driversByMonacher.get(id.toUpperCase());
   }
 
   /** Get restaurant by full UUID OR 8-char RestaurantIdKey */
@@ -182,8 +184,12 @@ export class OntologyStore {
 
   updateDrivers(drivers: Driver[]): void {
     this.drivers.clear();
+    this.driversByMonacher.clear();
     for (const driver of drivers) {
       this.drivers.set(driver.driverId, driver);
+      if (driver.monacher) {
+        this.driversByMonacher.set(driver.monacher.toUpperCase(), driver);
+      }
     }
   }
 

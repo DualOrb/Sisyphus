@@ -2,55 +2,45 @@
  * Main LangGraph dispatch graph — wires the supervisor and all
  * sub-agents into a single compiled StateGraph.
  *
- * Graph topology:
+ * Graph topology (parallel dispatch):
  *
  *   __start__ -> supervisor
- *   supervisor -> (conditional) -> market_monitor | driver_comms |
- *                                  customer_support | task_executor | __end__
- *   market_monitor   -> supervisor
- *   driver_comms     -> supervisor
- *   customer_support -> supervisor
- *   task_executor    -> supervisor
+ *   supervisor -> (conditional) -> [Send("agent_a", ...), Send("agent_b", ...)]  (parallel)
+ *                               -> __end__  (if no pending tasks)
+ *   driver_comms     -> bridge -> supervisor
+ *   customer_support -> bridge -> supervisor
  *
- * The supervisor is the entry point and the only node that decides
- * routing. Sub-agents always return control to the supervisor after
- * completing their work.
+ * The supervisor sets `pendingTasks` — an array of task assignments.
+ * The conditional edge reads that array and emits one `Send` per task,
+ * triggering parallel sub-agent execution. When all parallel paths
+ * complete, LangGraph merges results via the state reducer
+ * (messagesStateReducer for messages) and re-invokes the supervisor.
  *
  * @see planning/03-agent-design.md section 5
  */
 
-import { StateGraph, START, END, MemorySaver } from "@langchain/langgraph";
+import { StateGraph, START, END, MemorySaver, Send } from "@langchain/langgraph";
 import { DynamicStructuredTool } from "@langchain/core/tools";
 import { z } from "zod";
 import type { Redis as RedisClient } from "ioredis";
 import type { BaseCheckpointSaver } from "@langchain/langgraph-checkpoint";
 
-import { AgentState, type AgentStateType } from "./state.js";
+import { AgentState, type AgentStateType, type AgentStateUpdate } from "./state.js";
 import { createChatModel } from "./llm-factory.js";
 import {
   createSupervisorNode,
   AGENT_NAMES,
 } from "./supervisor/agent.js";
 import {
-  createMarketMonitorNode,
-  filterMarketMonitorTools,
-  MARKET_MONITOR_NAME,
-} from "./market-monitor/agent.js";
-import {
-  createDriverCommsNode,
   filterDriverCommsTools,
   DRIVER_COMMS_NAME,
+  DRIVER_COMMS_PREAMBLE,
 } from "./driver-comms/agent.js";
 import {
-  createCustomerSupportNode,
   filterCustomerSupportTools,
   CUSTOMER_SUPPORT_NAME,
+  CUSTOMER_SUPPORT_PREAMBLE,
 } from "./customer-support/agent.js";
-import {
-  createTaskExecutorNode,
-  filterTaskExecutorTools,
-  TASK_EXECUTOR_NAME,
-} from "./task-executor/agent.js";
 import { createOntologyTools } from "../tools/ontology-tools.js";
 import { createProcessTools } from "../tools/process-tools.js";
 import {
@@ -64,34 +54,70 @@ import type { ExecutionContext, AuditRecord } from "../guardrails/types.js";
 import type { ShadowExecutor } from "../execution/shadow/executor.js";
 import type { ShadowMetrics } from "../execution/shadow/metrics.js";
 import type { OntologyStore } from "../ontology/state/index.js";
+import { acquireLock, releaseLock } from "../memory/redis/locks.js";
+import { recordAction } from "../memory/redis/action-timeline.js";
+import { guessEntityType, guessEntityId } from "../lib/entity-helpers.js";
 import { createChildLogger } from "../lib/index.js";
 
 const log = createChildLogger("graph");
 
 // ---------------------------------------------------------------------------
-// Routing function
+// Routing function (parallel dispatch via Send)
 // ---------------------------------------------------------------------------
 
 /**
  * Conditional edge resolver for the supervisor node.
  *
- * Reads `state.nextAgent` (set by the supervisor) and returns the
- * corresponding node name or END.
+ * Reads `state.pendingTasks` (set by the supervisor) and returns an
+ * array of `Send` objects for parallel dispatch, or `END` if there
+ * are no tasks.
+ *
+ * Each `Send` copies the full message state into the target sub-agent
+ * and sets `currentTask` / `currentTaskType` to the specific assignment.
  */
-function supervisorRouter(state: AgentStateType): string {
-  const next = state.nextAgent;
+function supervisorRouter(state: AgentStateType): Send[] | typeof END {
+  const tasks = state.pendingTasks;
 
-  if (!next || next === "__end__") {
+  if (!tasks || tasks.length === 0) {
     return END;
   }
 
-  // Validate that the target is a known agent
-  if ((AGENT_NAMES as readonly string[]).includes(next)) {
-    return next;
+  // Validate and dispatch — one Send per task assignment
+  const sends: Send[] = [];
+
+  for (const task of tasks) {
+    if (!(AGENT_NAMES as readonly string[]).includes(task.agent)) {
+      log.warn({ agent: task.agent }, "Unknown agent in pendingTasks — skipping");
+      continue;
+    }
+
+    sends.push(
+      new Send(task.agent, {
+        // Carry forward the full message history so sub-agents have context
+        messages: state.messages,
+        // Set the specific task for this sub-agent
+        currentTask: task.task,
+        currentTaskType: task.taskType,
+        // Clear routing state for the sub-agent's execution
+        nextAgent: "",
+        pendingTasks: [],
+        needsEscalation: state.needsEscalation,
+        escalationReason: state.escalationReason,
+      }),
+    );
   }
 
-  log.warn({ nextAgent: next }, "Unknown routing target — ending graph");
-  return END;
+  if (sends.length === 0) {
+    log.warn("All tasks in pendingTasks had unknown agents — ending graph");
+    return END;
+  }
+
+  log.info(
+    { sendCount: sends.length, agents: sends.map((s) => s.node) },
+    "Dispatching parallel sub-agents",
+  );
+
+  return sends;
 }
 
 // ---------------------------------------------------------------------------
@@ -112,6 +138,12 @@ export interface CreateDispatchGraphOptions {
    * Pass a PostgresSaver for production use.
    */
   checkpointer?: BaseCheckpointSaver;
+
+  /**
+   * Callback for full agent activity visibility. Called for every tool call,
+   * tool result, and agent response across all agents.
+   */
+  onAgentActivity?: import("./create-agent.js").AgentActivityCallback;
 
   /**
    * Optional audit callback wired into the execute_action tool.
@@ -167,6 +199,7 @@ export async function createDispatchGraph(
     shadowExecutor,
     correlationId,
     processSelectionContext,
+    onAgentActivity,
   } = options;
 
   // -----------------------------------------------------------------------
@@ -183,44 +216,34 @@ export async function createDispatchGraph(
   // -----------------------------------------------------------------------
 
   let supervisorPrompt: string;
-  let marketMonitorPrompt: string;
   let driverCommsPrompt: string;
   let customerSupportPrompt: string;
-  let taskExecutorPrompt: string;
 
   if (processSelectionContext) {
     // Production path: lean per-agent prompts using selectRelevantProcesses.
     // Agents can still fetch additional procedures via the lookup_process tool.
     const supervisorBase = selectRelevantProcesses(processes, "supervisor", processSelectionContext);
-    const marketMonitorBase = selectRelevantProcesses(processes, "market-monitor", processSelectionContext);
     const driverCommsBase = selectRelevantProcesses(processes, "driver-comms", processSelectionContext);
     const customerSupportBase = selectRelevantProcesses(processes, "customer-support", processSelectionContext);
-    const taskExecutorBase = selectRelevantProcesses(processes, "task-executor", processSelectionContext);
 
     log.info(
       {
         supervisor: supervisorBase.length,
-        marketMonitor: marketMonitorBase.length,
         driverComms: driverCommsBase.length,
         customerSupport: customerSupportBase.length,
-        taskExecutor: taskExecutorBase.length,
         totalLibrary: processes.length,
       },
       "Base process files selected per agent (full library available via lookup_process tool)",
     );
 
     supervisorPrompt = buildSystemPrompt("supervisor", supervisorBase);
-    marketMonitorPrompt = buildSystemPrompt("market-monitor", marketMonitorBase);
     driverCommsPrompt = buildSystemPrompt("driver-comms", driverCommsBase);
     customerSupportPrompt = buildSystemPrompt("customer-support", customerSupportBase);
-    taskExecutorPrompt = buildSystemPrompt("task-executor", taskExecutorBase);
   } else {
     // Dev path: load all process files per agent (original behaviour).
     supervisorPrompt = buildSystemPrompt("supervisor", processes);
-    marketMonitorPrompt = buildSystemPrompt("market-monitor", processes);
     driverCommsPrompt = buildSystemPrompt("driver-comms", processes);
     customerSupportPrompt = buildSystemPrompt("customer-support", processes);
-    taskExecutorPrompt = buildSystemPrompt("task-executor", processes);
   }
 
   // -----------------------------------------------------------------------
@@ -269,63 +292,79 @@ export async function createDispatchGraph(
     systemPrompt: supervisorPrompt,
     ontologyTools: allTools,
     model: supervisorModel,
+    onActivity: onAgentActivity,
   });
 
-  const marketMonitorNode = createMarketMonitorNode({
-    processPrompt: marketMonitorPrompt,
-    tools: filterMarketMonitorTools(allTools),
-    model: defaultModel,
-  });
+  // Import createAgentNode directly so we can pass onActivity
+  const { createAgentNode } = await import("./create-agent.js");
 
-  const driverCommsNode = createDriverCommsNode({
-    processPrompt: driverCommsPrompt,
+  const driverCommsNode = createAgentNode({
+    name: DRIVER_COMMS_NAME,
+    systemPrompt: DRIVER_COMMS_PREAMBLE + "\n\n" + driverCommsPrompt,
     tools: filterDriverCommsTools(allTools),
     model: defaultModel,
+    onActivity: onAgentActivity,
   });
 
-  const customerSupportNode = createCustomerSupportNode({
-    processPrompt: customerSupportPrompt,
+  const customerSupportNode = createAgentNode({
+    name: CUSTOMER_SUPPORT_NAME,
+    systemPrompt: CUSTOMER_SUPPORT_PREAMBLE + "\n\n" + customerSupportPrompt,
     tools: filterCustomerSupportTools(allTools),
     model: defaultModel,
-  });
-
-  const taskExecutorNode = createTaskExecutorNode({
-    processPrompt: taskExecutorPrompt,
-    tools: filterTaskExecutorTools(allTools),
-    model: defaultModel,
+    onActivity: onAgentActivity,
   });
 
   // -----------------------------------------------------------------------
-  // 5. Build the graph
+  // 5. Build the graph (parallel dispatch via Send)
   // -----------------------------------------------------------------------
 
-  log.info("Building dispatch graph");
+  log.info("Building dispatch graph (parallel dispatch mode)");
+
+  // Bridge node: ensures message history ends with a HumanMessage before
+  // the supervisor is re-invoked. Some providers (Azure, Anthropic) reject
+  // conversations that end with an assistant message.
+  const bridgeNode = async (state: AgentStateType): Promise<AgentStateUpdate> => {
+    const { HumanMessage: HM } = await import("@langchain/core/messages");
+
+    // Surface escalation context directly in the bridge message so the
+    // supervisor sees it prominently (not just as a state flag).
+    let bridgeText = "Sub-agent work complete. Review the results above and decide: assign more tasks or call assign_tasks with an empty array to finish.";
+    if (state.needsEscalation && state.escalationReason) {
+      bridgeText =
+        `⚠️ ESCALATION from sub-agent: ${state.escalationReason}\n\n` +
+        `You MUST address this escalation before finishing. Either assign a sub-agent to handle it or acknowledge it.\n\n` +
+        bridgeText;
+    }
+
+    return {
+      messages: [new HM(bridgeText)],
+    };
+  };
 
   const graph = new StateGraph(AgentState)
     // Add all nodes
     .addNode("supervisor", supervisorNode)
-    .addNode(MARKET_MONITOR_NAME, marketMonitorNode)
     .addNode(DRIVER_COMMS_NAME, driverCommsNode)
     .addNode(CUSTOMER_SUPPORT_NAME, customerSupportNode)
-    .addNode(TASK_EXECUTOR_NAME, taskExecutorNode)
+    .addNode("bridge", bridgeNode)
 
     // Entry point: every invocation starts at the supervisor
     .addEdge(START, "supervisor")
 
-    // Supervisor routes to sub-agents or END via conditional edge
+    // Supervisor routes to sub-agents via Send[] for parallel dispatch,
+    // or END if no tasks are pending.
     .addConditionalEdges("supervisor", supervisorRouter, [
-      MARKET_MONITOR_NAME,
       DRIVER_COMMS_NAME,
       CUSTOMER_SUPPORT_NAME,
-      TASK_EXECUTOR_NAME,
       END,
     ])
 
-    // All sub-agents return to the supervisor after completing their work
-    .addEdge(MARKET_MONITOR_NAME, "supervisor")
-    .addEdge(DRIVER_COMMS_NAME, "supervisor")
-    .addEdge(CUSTOMER_SUPPORT_NAME, "supervisor")
-    .addEdge(TASK_EXECUTOR_NAME, "supervisor");
+    // All sub-agents return to the bridge node (not directly to supervisor).
+    // The bridge injects a HumanMessage so providers that require
+    // conversations to end with a user message don't reject the request.
+    .addEdge(DRIVER_COMMS_NAME, "bridge")
+    .addEdge(CUSTOMER_SUPPORT_NAME, "bridge")
+    .addEdge("bridge", "supervisor");
 
   // -----------------------------------------------------------------------
   // 6. Compile with checkpointer
@@ -336,7 +375,7 @@ export async function createDispatchGraph(
   const compiled = graph.compile({ checkpointer });
 
   log.info(
-    onAudit ? "Dispatch graph compiled with custom audit tools" : "Dispatch graph compiled successfully",
+    onAudit ? "Dispatch graph compiled with custom audit tools (parallel dispatch)" : "Dispatch graph compiled successfully (parallel dispatch)",
   );
 
   return compiled;
@@ -346,44 +385,21 @@ export async function createDispatchGraph(
 // Custom execute_action tool with caller-provided audit callback
 // ---------------------------------------------------------------------------
 
-/**
- * Infer entity type from an action name (e.g. "AssignDriverToOrder" -> "order").
- */
-export function guessEntityType(actionType: string): string {
-  if (actionType.includes("Order") || actionType.includes("Assign") || actionType.includes("Reassign"))
-    return "order";
-  if (actionType.includes("Driver") || actionType.includes("FollowUp"))
-    return "driver";
-  if (actionType.includes("Ticket") || actionType.includes("Escalate"))
-    return "ticket";
-  if (actionType.includes("Market")) return "market";
-  return "unknown";
-}
-
-/**
- * Best-effort extraction of the primary entity ID from action params.
- */
-export function guessEntityId(params: Record<string, unknown>): string {
-  return (
-    (params.orderId as string) ??
-    (params.order_id as string) ??
-    (params.driverId as string) ??
-    (params.driver_id as string) ??
-    (params.ticketId as string) ??
-    (params.ticket_id as string) ??
-    (params.market as string) ??
-    "unknown"
-  );
-}
+// Re-export entity helpers for backward compatibility with callers
+// that import them from this module (e.g. init/services.ts).
+export { guessEntityType, guessEntityId } from "../lib/entity-helpers.js";
 
 /**
  * Build a custom `execute_action` tool that:
+ * - Acquires a Redis lock on the target entity before execution (parallel safety)
  * - Passes the OntologyStore (as-is) to the execution context
  * - Invokes the caller-supplied `onAudit` callback
  * - Optionally records shadow proposals via ShadowExecutor
+ * - Releases the lock after execution (success or failure)
  *
- * This mirrors what shadow-live.ts does, but lives in core so both the
- * production init system and shadow-live can share the same logic.
+ * The lock prevents two parallel sub-agents from acting on the same
+ * entity simultaneously (e.g., two agents both trying to reassign the
+ * same order).
  */
 function createCustomExecuteActionTool(
   store: OntologyStore,
@@ -418,6 +434,46 @@ function createCustomExecuteActionTool(
         .describe("Your explanation of why you are taking this action. This is logged to the audit trail."),
     }),
     func: async (input) => {
+      // ------------------------------------------------------------------
+      // Entity locking for parallel safety
+      // ------------------------------------------------------------------
+      const entityType = guessEntityType(input.actionName);
+      const entityId = guessEntityId(input.params as Record<string, unknown>);
+      let lockAcquired = false;
+
+      if (entityType !== "unknown" && entityId !== "unknown") {
+        try {
+          const lockResult = await acquireLock(
+            redis,
+            entityType,
+            entityId,
+            agentId,
+            300, // 5-minute TTL — shorter than default since parallel tasks are fast
+          );
+
+          if (!lockResult.acquired) {
+            const holder = lockResult.holder?.agentId ?? "another agent";
+            log.info(
+              { entityType, entityId, holder, actionName: input.actionName },
+              "Entity locked by another agent — skipping action",
+            );
+            return JSON.stringify({
+              skipped: true,
+              reason: `Entity ${entityType}:${entityId} is being handled by ${holder}. Skipping to avoid conflict.`,
+            });
+          }
+
+          lockAcquired = true;
+          log.debug(
+            { entityType, entityId, actionName: input.actionName },
+            "Entity lock acquired",
+          );
+        } catch (err) {
+          // Lock acquisition failure should not block execution — log and continue
+          log.warn({ err, entityType, entityId }, "Failed to acquire entity lock — proceeding without lock");
+        }
+      }
+
       try {
         const executionContext: ExecutionContext = {
           redis,
@@ -429,7 +485,24 @@ function createCustomExecuteActionTool(
             // 1. Invoke the caller-provided audit callback
             await onAudit(record);
 
-            // 2. Record shadow proposal for executed/staged actions
+            // 2. Write to Redis entity timeline so agents can see
+            //    what actions have already been taken on this entity
+            //    via the get_entity_timeline tool.
+            try {
+              await recordAction(redis, entityType, entityId, {
+                action: record.actionType,
+                agent: record.agentId,
+                outcome: record.outcome,
+                reasoning: record.reasoning,
+                contentPreview: typeof record.params === "object"
+                  ? JSON.stringify(record.params).slice(0, 200)
+                  : undefined,
+              });
+            } catch (err) {
+              log.warn({ err, entityType, entityId }, "Failed to write action timeline");
+            }
+
+            // 3. Record shadow proposal for executed/staged actions
             if (extra.shadowExecutor && (record.outcome === "executed" || record.outcome === "staged")) {
               extra.shadowExecutor.setContext({
                 tier: "YELLOW",
@@ -459,6 +532,16 @@ function createCustomExecuteActionTool(
           error: "Failed to execute action",
           details: String(err),
         });
+      } finally {
+        // Always release the lock after execution
+        if (lockAcquired) {
+          try {
+            await releaseLock(redis, entityType, entityId, agentId);
+            log.debug({ entityType, entityId }, "Entity lock released");
+          } catch (err) {
+            log.warn({ err, entityType, entityId }, "Failed to release entity lock");
+          }
+        }
       }
     },
   });

@@ -20,6 +20,8 @@ import type { OntologyStore } from "../ontology/state/index.js";
 import { executeAction } from "../guardrails/index.js";
 import type { ExecutionContext } from "../guardrails/index.js";
 import { createChildLogger } from "../lib/index.js";
+import { guessEntityType, guessEntityId } from "../lib/entity-helpers.js";
+import { acquireLock, releaseLock } from "../memory/redis/locks.js";
 import { DynamoDBClient, QueryCommand } from "@aws-sdk/client-dynamodb";
 import { unmarshall } from "@aws-sdk/util-dynamodb";
 
@@ -110,24 +112,31 @@ export function createOntologyTools(
   const queryDriversTool = new DynamicStructuredTool({
     name: "query_drivers",
     description:
-      "Query drivers from the ontology with optional filters. Returns an array of driver summaries " +
-      "including driverId, name, dispatchZone, isAvailable, isPaused, isOnline, and activeOrdersCount. " +
-      "Use this to find available drivers in a zone, check driver capacity, etc.",
+      "Query drivers from the ontology with optional filters. Returns driver summaries with " +
+      "driverId (email), name, monacher (short code), dispatchZone, isOnline, isAvailable, isPaused, status, activeOrdersCount. " +
+      "IMPORTANT: 'isAvailable' means the driver toggled on-call in the app — it does NOT mean they are working. " +
+      "Use 'isOnline' to check if a driver is actually on-shift and available for dispatch. " +
+      "To find all working drivers in a zone, query WITHOUT isAvailable filter and check isOnline in results.",
     schema: z.object({
       dispatchZone: z
         .string()
         .nullable().optional()
         .describe("Filter by dispatch zone name"),
-      isAvailable: z
-        .boolean()
-        .nullable().optional()
-        .describe("Filter by availability flag (true = accepting orders)"),
+      isAvailable: z.preprocess(
+        (v) => (v === "null" || v === "undefined" || v === "" ? undefined : v),
+        z.boolean().nullable().optional(),
+      ).describe("Filter by on-call toggle (NOT whether driver is working — use isOnline for that). Omit to return all."),
+      isOnline: z.preprocess(
+        (v) => (v === "null" || v === "undefined" || v === "" ? undefined : v),
+        z.boolean().nullable().optional(),
+      ).describe("Filter by whether driver is currently on-shift and working. Omit to return all."),
     }),
     func: async (input) => {
       try {
         const drivers = store.queryDrivers({
           dispatchZone: input.dispatchZone ?? undefined,
           isAvailable: input.isAvailable ?? undefined,
+          isOnline: input.isOnline ?? undefined,
         });
 
         const summaries = drivers.map((d) => ({
@@ -360,10 +369,10 @@ export function createOntologyTools(
     }),
     func: async (input) => {
       try {
-        const key = `timeline:${input.entityType}:${input.entityId}`;
+        const key = `actions:${input.entityType}:${input.entityId}`;
         const hours = input.hours ?? 24;
-        const cutoff = Date.now() - hours * 60 * 60 * 1000;
-        const cutoffScore = cutoff.toString();
+        // recordAction stores scores as Unix epoch seconds (Date.now() / 1000)
+        const cutoffScore = (Date.now() / 1000 - hours * 60 * 60).toString();
 
         // Retrieve timeline entries from a Redis sorted set
         // Entries are stored as JSON strings scored by timestamp
@@ -386,7 +395,7 @@ export function createOntologyTools(
           try {
             const data = JSON.parse(value) as Record<string, unknown>;
             events.push({
-              timestamp: new Date(Number(score)).toISOString(),
+              timestamp: new Date(Number(score) * 1000).toISOString(),
               data,
             });
           } catch {
@@ -448,6 +457,41 @@ export function createOntologyTools(
         ),
     }),
     func: async (input) => {
+      // ------------------------------------------------------------------
+      // Entity locking for parallel safety
+      // ------------------------------------------------------------------
+      const entityType = guessEntityType(input.actionName);
+      const entityId = guessEntityId(input.params as Record<string, unknown>);
+      let lockAcquired = false;
+
+      if (entityType !== "unknown" && entityId !== "unknown") {
+        try {
+          const lockResult = await acquireLock(
+            redis,
+            entityType,
+            entityId,
+            agentId,
+            300, // 5-minute TTL
+          );
+
+          if (!lockResult.acquired) {
+            const holder = lockResult.holder?.agentId ?? "another agent";
+            log.info(
+              { entityType, entityId, holder, actionName: input.actionName },
+              "Entity locked by another agent — skipping action",
+            );
+            return JSON.stringify({
+              skipped: true,
+              reason: `Entity ${entityType}:${entityId} is being handled by ${holder}. Skipping to avoid conflict.`,
+            });
+          }
+
+          lockAcquired = true;
+        } catch (err) {
+          log.warn({ err, entityType, entityId }, "Failed to acquire entity lock — proceeding without lock");
+        }
+      }
+
       try {
         const executionContext: ExecutionContext = {
           redis,
@@ -483,6 +527,14 @@ export function createOntologyTools(
           error: "Failed to execute action",
           details: String(err),
         });
+      } finally {
+        if (lockAcquired) {
+          try {
+            await releaseLock(redis, entityType, entityId, agentId);
+          } catch (err) {
+            log.warn({ err, entityType, entityId }, "Failed to release entity lock");
+          }
+        }
       }
     },
   });

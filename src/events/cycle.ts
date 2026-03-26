@@ -136,6 +136,15 @@ export class DispatchCycle {
   /** Snapshot of the previous store state for EventDetector diff. */
   private previousStore: OntologyStore | undefined;
 
+  /**
+   * Event deduplication — tracks which issues have already been dispatched
+   * to prevent the same late order / offline driver from being reported
+   * every 20 seconds. Key = dedup key (e.g. "late:dfee7605"), Value = timestamp.
+   * Entries expire after 5 minutes to allow re-reporting if still unresolved.
+   */
+  private readonly dispatchedIssues = new Map<string, number>();
+  private static readonly DEDUP_TTL_MS = 300_000; // 5 minutes
+
   constructor(config: DispatchCycleConfig) {
     this.store = config.store;
     this.graph = config.graph;
@@ -192,6 +201,32 @@ export class DispatchCycle {
           (changes as any).hasChanges = true;
           log.info({ count: wsMessages.length }, "WebSocket driver messages added to changes");
         }
+      }
+    }
+
+    // ------------------------------------------------------------------
+    // 2b. Annotate recurring issues — tell the supervisor what it already
+    //     acted on so it can decide to escalate vs wait, instead of
+    //     treating every recurrence as a brand-new issue.
+    // ------------------------------------------------------------------
+    if (!this.isFirstCycle && changes.hasChanges) {
+      const now = Date.now();
+
+      // Expire old entries
+      for (const [key, ts] of this.dispatchedIssues) {
+        if (now - ts > DispatchCycle.DEDUP_TTL_MS) {
+          this.dispatchedIssues.delete(key);
+        }
+      }
+
+      for (const d of changes.details) {
+        const key = `${d.type}:${d.zone ?? ""}:${d.description.slice(0, 60)}`;
+        const prevTime = this.dispatchedIssues.get(key);
+        if (prevTime) {
+          const agoMin = ((now - prevTime) / 60_000).toFixed(1);
+          d.description += ` [PREVIOUSLY FLAGGED ${agoMin}min ago — check if action was taken, escalate if unresolved]`;
+        }
+        this.dispatchedIssues.set(key, prevTime ?? now); // keep original timestamp
       }
     }
 
@@ -493,14 +528,13 @@ function detectChanges(
       const prev = prevOrderMap.get(o.OrderId);
       if (!prev) {
         const driver = curDrivers.find((d: any) => d.DriverId === o.DriverId);
-        const driverName =
-          driver?.Monacher ||
-          driver?.FullName ||
-          (o.DriverId ? o.DriverId.split("@")[0] : "none");
+        const driverLabel = o.DriverId
+          ? `${driver?.Monacher || driver?.FullName || "unknown"} (${o.DriverId})`
+          : "UNASSIGNED";
         details.push({
           type: "new_order",
           zone,
-          description: `New order ${o.OrderIdKey} from ${o.RestaurantName} (${o.OrderStatus}) -- driver: ${driverName}`,
+          description: `New order ${o.OrderIdKey} from ${o.RestaurantName} (${o.OrderStatus}) — ${o.DriverId ? "assigned to" : "UNASSIGNED, needs"} driver: ${driverLabel}`,
         });
       } else if (prev.OrderStatus !== o.OrderStatus) {
         details.push({
@@ -577,6 +611,68 @@ function detectChanges(
 }
 
 // ---------------------------------------------------------------------------
+// Order status helpers — derive real status from StatusHistory + time fields
+// ---------------------------------------------------------------------------
+
+interface OrderStatusInfo {
+  /** The real current status derived from StatusHistory (e.g. "At-Restaurant", "En-Route") */
+  currentStatus: string;
+  /** Compact timeline string for the prompt */
+  timeline: string;
+  /** Whether this order is truly late (past ready, driver not actively working on it) */
+  isLate: boolean;
+  /** Whether driver has confirmed/acknowledged the order */
+  driverConfirmed: boolean;
+}
+
+function deriveOrderStatus(o: any): OrderStatusInfo {
+  const history: { status: string; timestamp: number }[] = o.StatusHistory ?? [];
+  const lastEntry = history.length > 0 ? history[history.length - 1] : null;
+
+  // Real current status = last entry in StatusHistory, falling back to OrderStatus
+  const currentStatus = lastEntry?.status ?? o.OrderStatus ?? "Unknown";
+
+  // Build compact timeline: "Confirmed 10:02 → En-Route 10:05 → At-Restaurant 10:06"
+  const timelineParts: string[] = [];
+  for (const h of history) {
+    const t = new Date(h.timestamp * 1000).toLocaleTimeString("en-US", {
+      hour: "numeric", minute: "2-digit", hour12: true, timeZone: TZ,
+    });
+    timelineParts.push(`${h.status} ${t}`);
+  }
+  // Add timestamps from individual fields if not in history
+  if (timelineParts.length === 0) {
+    if (o.OrderPlacedTime) timelineParts.push(`Placed ${formatTime(new Date(o.OrderPlacedTime * 1000))}`);
+    if (o.DeliveryConfirmedTime) timelineParts.push(`Confirmed ${formatTime(new Date(o.DeliveryConfirmedTime * 1000))}`);
+    if (o.EnrouteTime) timelineParts.push(`En-Route ${formatTime(new Date(o.EnrouteTime * 1000))}`);
+    if (o.WaitingForOrderTime) timelineParts.push(`At-Restaurant ${formatTime(new Date(o.WaitingForOrderTime * 1000))}`);
+  }
+  const timeline = timelineParts.join(" → ");
+
+  const readyTime = o.OrderReadyTime ? new Date(o.OrderReadyTime * 1000) : null;
+
+  // Statuses that mean the driver is actively working on this order
+  const activeStatuses = ["En-Route", "At-Restaurant", "In-Bag", "InTransit", "At-Customer"];
+  const isDriverActive = activeStatuses.some(
+    (s) => currentStatus.toLowerCase().replace(/[-_ ]/g, "") === s.toLowerCase().replace(/[-_ ]/g, ""),
+  );
+
+  // Only flag as LATE if past ready time AND driver is NOT actively working on it
+  const isLate = !!(
+    readyTime &&
+    readyTime.getTime() < Date.now() &&
+    !isDriverActive &&
+    currentStatus !== "InTransit" &&
+    currentStatus !== "Completed" &&
+    currentStatus !== "Cancelled"
+  );
+
+  const driverConfirmed = !!(o.DeliveryConfirmed || o.DeliveryConfirmedTime);
+
+  return { currentStatus, timeline, isLate, driverConfirmed };
+}
+
+// ---------------------------------------------------------------------------
 // Prompt builder: dispatch.txt situation prompt for the graph
 // ---------------------------------------------------------------------------
 
@@ -613,17 +709,21 @@ function buildChangesPrompt(
           d.Alcohol ? "smartserve" : "",
           d.NearEnd ? "NEAR-END" : "",
         ].filter(Boolean).join(", ");
-        lines.push(`  ${name}: ${status}, ${orderCount} orders${flags ? ` [${flags}]` : ""}`);
+        lines.push(`  ${name} (${d.DriverId}): ${status}, ${orderCount} orders${flags ? ` [${flags}]` : ""}`);
       }
 
       for (const o of orders) {
         const readyTime = o.OrderReadyTime ? new Date(o.OrderReadyTime * 1000) : null;
         const driver = drivers.find((d: any) => d.DriverId === o.DriverId);
-        const driverName = driver?.Monacher || driver?.FullName?.split(" ")[0] || (o.DriverId ? o.DriverId.split("@")[0] : "UNASSIGNED");
-        const isLate = readyTime && readyTime.getTime() < Date.now() && !["InTransit"].includes(o.OrderStatus);
+        const driverMonacher = driver?.Monacher || driver?.FullName?.split(" ")[0] || null;
+        const driverEmail = o.DriverId || null;
+        const driverLabel = driverMonacher && driverEmail
+          ? `${driverMonacher} (${driverEmail})`
+          : driverMonacher || driverEmail || "UNASSIGNED";
+        const status = deriveOrderStatus(o);
         const alcohol = o.Alcohol ? " [ALCOHOL]" : "";
         lines.push(
-          `  Order ${o.OrderIdKey}: ${o.OrderStatus}${isLate ? " LATE" : ""}${alcohol} | ${o.RestaurantName} -> ${o.DeliveryStreet || "?"}, ${o.DeliveryCity || ""} | Driver: ${driverName} | Ready: ${formatTime(readyTime)} (${minutesAgo(readyTime)})`,
+          `  Order ${o.OrderIdKey}: ${status.currentStatus}${status.isLate ? " LATE" : ""}${alcohol} | ${o.RestaurantName} -> ${o.DeliveryStreet || "?"}, ${o.DeliveryCity || ""} | Driver: ${driverLabel} | Ready: ${formatTime(readyTime)} (${minutesAgo(readyTime)})${status.timeline ? ` | ${status.timeline}` : ""}`,
         );
       }
       lines.push(``);
@@ -665,16 +765,20 @@ function buildChangesPrompt(
         const status = d.Paused ? "PAUSED" : d.OnShift ? "ON-SHIFT" : "OFF";
         const orderCount = orders.filter((o: any) => o.DriverId === d.DriverId).length;
         const name = d.Monacher || d.FullName?.split(" ")[0] || d.DriverId.split("@")[0];
-        lines.push(`  ${name}: ${status}, ${orderCount} orders`);
+        lines.push(`  ${name} (${d.DriverId}): ${status}, ${orderCount} orders`);
       }
       for (const o of orders) {
         const readyTime = o.OrderReadyTime ? new Date(o.OrderReadyTime * 1000) : null;
         const driver = drivers.find((d: any) => d.DriverId === o.DriverId);
-        const driverName = driver?.Monacher || driver?.FullName?.split(" ")[0] || "?";
-        const isLate = readyTime && readyTime.getTime() < Date.now() && !["InTransit"].includes(o.OrderStatus);
+        const driverMonacher = driver?.Monacher || driver?.FullName?.split(" ")[0] || null;
+        const driverEmail = o.DriverId || null;
+        const driverLabel = driverMonacher && driverEmail
+          ? `${driverMonacher} (${driverEmail})`
+          : driverMonacher || driverEmail || "UNASSIGNED";
+        const status = deriveOrderStatus(o);
         const alcohol = o.Alcohol ? " [ALCOHOL]" : "";
         lines.push(
-          `  Order ${o.OrderIdKey}: ${o.OrderStatus}${isLate ? " LATE" : ""}${alcohol} | ${o.RestaurantName} | Driver: ${driverName} | Ready: ${formatTime(readyTime)} (${minutesAgo(readyTime)})`,
+          `  Order ${o.OrderIdKey}: ${status.currentStatus}${status.isLate ? " LATE" : ""}${alcohol} | ${o.RestaurantName} | Driver: ${driverLabel} | Ready: ${formatTime(readyTime)} (${minutesAgo(readyTime)})${status.timeline ? ` | ${status.timeline}` : ""}`,
         );
       }
       lines.push(``);

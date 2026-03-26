@@ -14,7 +14,7 @@
  */
 
 // State definition
-export { AgentState, type AgentStateType, type AgentStateUpdate } from "./state.js";
+export { AgentState, type AgentStateType, type AgentStateUpdate, type TaskAssignment } from "./state.js";
 
 // LLM factory
 export { createChatModel } from "./llm-factory.js";
@@ -26,19 +26,13 @@ export { createAgentNode, type AgentNodeConfig } from "./create-agent.js";
 export {
   createSupervisorNode,
   AGENT_NAMES,
+  assignTasksTool,
   routeDecisionTool,
   type AgentName,
   type SupervisorConfig,
 } from "./supervisor/agent.js";
 
 // Sub-agents
-export {
-  createMarketMonitorNode,
-  filterMarketMonitorTools,
-  MARKET_MONITOR_NAME,
-  type MarketMonitorConfig,
-} from "./market-monitor/agent.js";
-
 export {
   createDriverCommsNode,
   filterDriverCommsTools,
@@ -52,13 +46,6 @@ export {
   CUSTOMER_SUPPORT_NAME,
   type CustomerSupportConfig,
 } from "./customer-support/agent.js";
-
-export {
-  createTaskExecutorNode,
-  filterTaskExecutorTools,
-  TASK_EXECUTOR_NAME,
-  type TaskExecutorConfig,
-} from "./task-executor/agent.js";
 
 // Graph
 export {

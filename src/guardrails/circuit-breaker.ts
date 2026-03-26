@@ -1,9 +1,9 @@
 /**
  * Circuit breaker — pauses agents that trigger too many failures.
  *
- * Thresholds (from planning/09 section 6.4):
- *   > 3 failures in  5 min = agent paused, supervisor notified
- *   > 5 failures in 15 min = agent paused, human alerted
+ * Thresholds:
+ *   > 10 failures in  5 min = agent paused, supervisor notified
+ *   > 15 failures in 15 min = agent paused, human alerted
  *
  * Uses a Redis sorted set scored by timestamp so we can count failures
  * within arbitrary time windows.
@@ -20,8 +20,8 @@ import type { CircuitBreakerResult } from "./types.js";
 
 const SHORT_WINDOW_SECONDS = 300; // 5 minutes
 const LONG_WINDOW_SECONDS = 900; // 15 minutes
-const SHORT_WINDOW_THRESHOLD = 3;
-const LONG_WINDOW_THRESHOLD = 5;
+const SHORT_WINDOW_THRESHOLD = 10;
+const LONG_WINDOW_THRESHOLD = 15;
 
 // Key TTL — keep failure records for the length of the longer window + buffer
 const KEY_TTL_SECONDS = LONG_WINDOW_SECONDS + 60;

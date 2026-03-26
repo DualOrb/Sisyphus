@@ -206,6 +206,22 @@ async function main() {
       hasLateOrders: true,
       hasNewMessages: true,
     },
+    onAgentActivity: (entry) => {
+      const prefix = `  [${entry.agent}] i${entry.iteration}`;
+      if (entry.type === "tool_call") {
+        logBoth(`${prefix} 🔧 ${entry.content.slice(0, 120)}`);
+        logFile(`${prefix} FULL_TOOL_CALL: ${entry.content}`);
+      } else if (entry.type === "tool_result") {
+        logBoth(`${prefix} → ${entry.content.slice(0, 120)}`);
+        logFile(`${prefix} FULL_RESULT: ${entry.content}`);
+      } else if (entry.type === "response") {
+        logBoth(`${prefix} 💬 ${entry.content.slice(0, 120)}`);
+        logFile(`${prefix} FULL_RESPONSE:\n${entry.content}\n---`);
+      } else if (entry.type === "summary") {
+        logBoth(`${prefix} 📋 ${entry.content.slice(0, 120)}`);
+        logFile(`${prefix} FULL_SUMMARY:\n${entry.content}\n---`);
+      }
+    },
   });
 
   // ---- Dispatch cycle ----
@@ -229,25 +245,46 @@ async function main() {
 
   logBoth(`\n  \x1b[32m[${now()}] Ready.\x1b[0m\n`);
 
-  // ---- Poll loop ----
-  const poll = async () => {
-    cycleCount++;
+  // ---- Two loops: fast sync + slow graph ----
+  // 1. Fast sync: fetches dispatch.txt every 20s, keeps the store fresh
+  // 2. Slow graph: invokes the LLM when changes are detected, runs to completion
+  //    The store stays up-to-date even while the graph is running.
+
+  let latestDispatchData: any = null;
+  let graphRunning = false;
+  let syncCount = 0;
+
+  // Fast sync — runs every POLL_INTERVAL_MS regardless of graph state
+  const sync = async () => {
+    syncCount++;
     try {
       const data = await fetchDispatchFile();
+      latestDispatchData = data;
       syncer.syncFromDispatchFile(data);
 
-      // Tickets every 3rd cycle
-      if (cycleCount === 1 || cycleCount % 3 === 0) {
+      // Tickets every 3rd sync
+      if (syncCount === 1 || syncCount % 3 === 0) {
         try {
           const tickets = await fetchRelevantTickets();
           syncer.syncTickets(tickets);
-          if (tickets.length > 0 && cycleCount === 1) {
+          if (tickets.length > 0 && syncCount === 1) {
             logBoth(`  [${now()}] ${tickets.length} tickets synced`);
           }
         } catch { /* non-fatal */ }
       }
+    } catch (err: any) {
+      logBoth(`  \x1b[31m[${now()}] Sync error: ${err.message}\x1b[0m`);
+    }
+  };
 
-      const result = await dispatchCycle.run(data);
+  // Slow graph — invoked after each sync, but only if the previous run is done
+  const runCycle = async () => {
+    if (graphRunning || !latestDispatchData) return;
+    graphRunning = true;
+    cycleCount++;
+
+    try {
+      const result = await dispatchCycle.run(latestDispatchData);
 
       if (result.graphInvoked) {
         logBoth(`  \x1b[32m[${now()}] Cycle #${cycleCount}: ${result.reason} — ${result.changesDetected} changes, ${result.eventsProcessed} events\x1b[0m`);
@@ -262,11 +299,20 @@ async function main() {
     } catch (err: any) {
       errorCount++;
       logBoth(`  \x1b[31m[${now()}] Error: ${err.message}\x1b[0m`);
+    } finally {
+      graphRunning = false;
     }
   };
 
-  await poll();
-  const interval = setInterval(poll, POLL_INTERVAL_MS);
+  // Initial sync + cycle
+  await sync();
+  await runCycle();
+
+  // Then: sync every 20s, try to run cycle after each sync
+  const interval = setInterval(async () => {
+    await sync();
+    runCycle(); // fire-and-forget — don't await, don't block next sync
+  }, POLL_INTERVAL_MS);
 
   // ---- Shutdown ----
   process.on("SIGINT", async () => {
@@ -274,7 +320,7 @@ async function main() {
     const duration = ((Date.now() - startTime) / 1000 / 60).toFixed(1);
     const metrics = shadowMetrics.getSummary();
 
-    logBoth(`\n\x1b[1m  Summary: ${duration}min, ${cycleCount} cycles, ${errorCount} errors, ${metrics.total} proposals, ${auditRecords.length} audits\x1b[0m\n`);
+    logBoth(`\n\x1b[1m  Summary: ${duration}min, ${cycleCount} cycles, ${errorCount} errors, ${metrics.totalProposals} proposals, ${auditRecords.length} audits\x1b[0m\n`);
 
     try {
       const report = generateShiftReport({
