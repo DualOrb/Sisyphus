@@ -14,6 +14,7 @@ import "dotenv/config";
 import { S3Client, GetObjectCommand } from "@aws-sdk/client-s3";
 import { DynamoDBClient, QueryCommand } from "@aws-sdk/client-dynamodb";
 import { unmarshall } from "@aws-sdk/util-dynamodb";
+import { mkdirSync, appendFileSync } from "node:fs";
 
 import { OntologyStore } from "../src/ontology/state/store.js";
 import {
@@ -33,9 +34,10 @@ const REGION = process.env.AWS_REGION ?? "us-east-1";
 const s3 = new S3Client({ region: REGION });
 const dynamo = new DynamoDBClient({ region: REGION });
 
-const POLL_INTERVAL_MS = 20_000; // 20 seconds — matches dispatch.txt update frequency
-const HEARTBEAT_INTERVAL_MS = 90_000; // 90 seconds — background health check
-const LLM_COOLDOWN_MS = 30_000; // Don't call LLM more than once per 30s
+const POLL_INTERVAL_MS = 20_000;
+const HEARTBEAT_INTERVAL_MS = 90_000;
+const LLM_COOLDOWN_MS = 30_000;
+// Model is set via LLM_MODEL in .env
 
 // ---------------------------------------------------------------------------
 // State
@@ -48,7 +50,30 @@ let totalLlmCalls = 0;
 let totalEventsProcessed = 0;
 let cycleCount = 0;
 let latestDispatchData: any = null;
+let previousDispatchData: any = null;
+let isFirstCycle = true;
 const startTime = Date.now();
+
+// Log file
+const TZ = process.env.BUSINESS_TIMEZONE ?? "America/Toronto";
+const logDate = new Date().toLocaleDateString("en-CA", { timeZone: TZ }); // YYYY-MM-DD
+mkdirSync("reports", { recursive: true });
+const LOG_FILE = `reports/shadow-${logDate}.md`;
+
+function now(): string {
+  return new Date().toLocaleTimeString("en-US", { hour: "numeric", minute: "2-digit", second: "2-digit", hour12: true, timeZone: TZ });
+}
+
+function log(text: string) {
+  console.log(text);
+  // Strip ANSI color codes for the file
+  const clean = text.replace(/\x1b\[[0-9;]*m/g, "");
+  appendFileSync(LOG_FILE, clean + "\n");
+}
+
+function logRaw(text: string) {
+  appendFileSync(LOG_FILE, text + "\n");
+}
 
 // Two hardcoded restaurant IDs to exclude (from dispatch page code)
 const EXCLUDED_RESTAURANTS = new Set([
@@ -129,41 +154,129 @@ function parseDispatchData(data: any): {
 }
 
 // ---------------------------------------------------------------------------
-// Diff detection
+// Diff detection — captures SPECIFIC changes, not just counts
 // ---------------------------------------------------------------------------
+
+interface ChangeDetail {
+  type: "new_order" | "order_status" | "order_completed" | "order_assigned" | "driver_online" | "driver_offline" | "driver_paused" | "driver_unpaused" | "driver_appeared" | "driver_disappeared";
+  description: string;
+  zone?: string;
+}
+
+interface Changes {
+  details: ChangeDetail[];
+  hasChanges: boolean;
+  summary: string;
+}
 
 function detectChanges(
   current: OntologyStore,
   previous: OntologyStore | null,
-): { newOrders: number; statusChanges: number; driverChanges: number } {
-  if (!previous) return { newOrders: 0, statusChanges: 0, driverChanges: 0 };
+  currentData: any,
+  previousData: any,
+): Changes {
+  const details: ChangeDetail[] = [];
 
-  let newOrders = 0;
-  let statusChanges = 0;
-  let driverChanges = 0;
+  if (!previous || !previousData) {
+    return { details, hasChanges: false, summary: "Initial sync" };
+  }
 
-  // Check for new orders or status changes
-  const currentOrders = current.queryOrders({});
-  for (const order of currentOrders) {
-    const prev = previous.getOrder(order.orderId);
-    if (!prev) {
-      newOrders++;
-    } else if (prev.status !== order.status) {
-      statusChanges++;
+  const zones = Object.keys(currentData).filter((k) => k !== "Timestamp");
+
+  for (const zone of zones) {
+    const curOrders = currentData[zone]?.Orders ?? [];
+    const prevOrders = previousData[zone]?.Orders ?? [];
+    const curDrivers = currentData[zone]?.Drivers ?? [];
+    const prevDrivers = previousData[zone]?.Drivers ?? [];
+
+    const prevOrderMap = new Map(prevOrders.map((o: any) => [o.OrderId, o]));
+    const prevDriverMap = new Map(prevDrivers.map((d: any) => [d.DriverId, d]));
+    const curOrderMap = new Map(curOrders.map((o: any) => [o.OrderId, o]));
+    const curDriverMap = new Map(curDrivers.map((d: any) => [d.DriverId, d]));
+
+    // New orders
+    for (const o of curOrders) {
+      const prev = prevOrderMap.get(o.OrderId);
+      if (!prev) {
+        const driver = curDrivers.find((d: any) => d.DriverId === o.DriverId);
+        const driverName = driver?.Monacher || driver?.FullName || (o.DriverId ? o.DriverId.split("@")[0] : "none");
+        details.push({
+          type: "new_order",
+          zone,
+          description: `New order ${o.OrderIdKey} from ${o.RestaurantName} (${o.OrderStatus}) — driver: ${driverName}`,
+        });
+      } else if (prev.OrderStatus !== o.OrderStatus) {
+        details.push({
+          type: "order_status",
+          zone,
+          description: `Order ${o.OrderIdKey} (${o.RestaurantName}): ${prev.OrderStatus} → ${o.OrderStatus}`,
+        });
+      }
+      // Driver assignment changed
+      if (prev && prev.DriverId !== o.DriverId && o.DriverId) {
+        const newDriver = curDrivers.find((d: any) => d.DriverId === o.DriverId);
+        const oldDriver = prevDrivers.find((d: any) => d.DriverId === prev.DriverId);
+        details.push({
+          type: "order_assigned",
+          zone,
+          description: `Order ${o.OrderIdKey} reassigned: ${oldDriver?.Monacher || "none"} → ${newDriver?.Monacher || o.DriverId.split("@")[0]}`,
+        });
+      }
+    }
+
+    // Orders that disappeared = delivered/completed (normal)
+    for (const o of prevOrders) {
+      if (!curOrderMap.has(o.OrderId)) {
+        details.push({
+          type: "order_completed",
+          zone,
+          description: `Order ${o.OrderIdKey} (${o.RestaurantName}) delivered/completed`,
+        });
+      }
+    }
+
+    // Driver changes
+    for (const d of curDrivers) {
+      const prev = prevDriverMap.get(d.DriverId);
+      const name = d.Monacher || d.FullName || d.DriverId.split("@")[0];
+      if (!prev) {
+        details.push({
+          type: "driver_appeared",
+          zone,
+          description: `Driver ${name} appeared in ${zone} (${d.OnShift ? "on-shift" : "off-shift"})`,
+        });
+      } else {
+        if (!prev.OnShift && d.OnShift) {
+          details.push({ type: "driver_online", zone, description: `Driver ${name} came on-shift in ${zone}` });
+        } else if (prev.OnShift && !d.OnShift) {
+          details.push({ type: "driver_offline", zone, description: `Driver ${name} went off-shift in ${zone}` });
+        }
+        if (!prev.Paused && d.Paused) {
+          details.push({ type: "driver_paused", zone, description: `Driver ${name} was paused in ${zone}` });
+        } else if (prev.Paused && !d.Paused) {
+          details.push({ type: "driver_unpaused", zone, description: `Driver ${name} was unpaused in ${zone}` });
+        }
+      }
+    }
+
+    // Drivers that disappeared
+    for (const d of prevDrivers) {
+      if (!curDriverMap.has(d.DriverId)) {
+        const name = d.Monacher || d.FullName || d.DriverId.split("@")[0];
+        details.push({
+          type: "driver_disappeared",
+          zone,
+          description: `Driver ${name} left dispatch in ${zone}`,
+        });
+      }
     }
   }
 
-  // Check for driver state changes
-  const currentDrivers = current.queryDrivers({});
-  for (const driver of currentDrivers) {
-    const prev = previous.getDriver(driver.driverId);
-    if (!prev) continue;
-    if (prev.isOnline !== driver.isOnline || prev.isPaused !== driver.isPaused) {
-      driverChanges++;
-    }
-  }
+  const summary = details.length > 0
+    ? details.map((d) => d.description).join("; ")
+    : "No changes";
 
-  return { newOrders, statusChanges, driverChanges };
+  return { details, hasChanges: details.length > 0, summary };
 }
 
 // ---------------------------------------------------------------------------
@@ -183,106 +296,103 @@ function minutesAgo(date: Date | null | undefined): string {
   return `${mins}m ago`;
 }
 
-function buildSituationReport(
-  store: OntologyStore,
+function buildChangesPrompt(
+  changes: Changes,
   dispatchData: any,
-  events: PrioritizedEvent[],
+  isFirstCycle: boolean,
 ): string {
-  const allOrders = store.queryOrders({});
-  const allDrivers = store.queryDrivers({});
   const zones = Object.keys(dispatchData).filter((k) => k !== "Timestamp");
+  const lines: string[] = [];
 
-  const lines: string[] = [
-    `SISYPHUS SHADOW DISPATCH — ${new Date().toLocaleString("en-US", { timeZone: "America/Toronto" })}`,
-    `Mode: SHADOW (analysis only — describe what you WOULD do, do not take actions)`,
-    ``,
-  ];
+  if (isFirstCycle) {
+    // First cycle — give full board state
+    lines.push(`SISYPHUS SHADOW DISPATCH — ${new Date().toLocaleString("en-US", { timeZone: "America/Toronto" })}`);
+    lines.push(`This is the initial state. Review the full board and identify any issues.`);
+    lines.push(``);
 
-  // ── Per-market breakdown with orders and drivers ──
-  for (const zone of zones) {
-    const zoneData = dispatchData[zone];
-    const zoneOrders = zoneData.Orders ?? [];
-    const zoneDrivers = zoneData.Drivers ?? [];
-    const meter = zoneData.Meter;
-    const onShift = zoneDrivers.filter((d: any) => d.OnShift && !d.Paused);
-    const paused = zoneDrivers.filter((d: any) => d.Paused);
+    for (const zone of zones) {
+      const zd = dispatchData[zone];
+      const orders = zd.Orders ?? [];
+      const drivers = zd.Drivers ?? [];
+      if (orders.length === 0 && drivers.length === 0) continue;
 
-    if (zoneOrders.length === 0 && onShift.length === 0) continue; // skip empty/inactive markets
+      const onShift = drivers.filter((d: any) => d.OnShift && !d.Paused);
+      lines.push(`── ${zone} (${onShift.length} drivers on-shift, ${orders.length} orders) ──`);
 
-    lines.push(`── ${zone} (Score: ${meter?.Score ?? "?"}, Drivers: ${onShift.length} on-shift${paused.length ? `, ${paused.length} paused` : ""}) ──`);
-
-    // Drivers in this zone
-    if (zoneDrivers.length > 0) {
-      lines.push(`  Drivers:`);
-      for (const d of zoneDrivers) {
+      for (const d of drivers) {
         const status = d.Paused ? "PAUSED" : d.OnShift ? "ON-SHIFT" : d.Available ? "ON-CALL" : "OFF";
-        const orderCount = zoneOrders.filter((o: any) => o.DriverId === d.DriverId).length;
-        const name = d.Monacher || d.FullName || d.DriverId;
-        const training = d.TrainingOrders > 0 ? ` [TRAINEE: ${d.TrainingOrders} orders left]` : "";
-        const alcohol = d.Alcohol ? " [Smart Serve]" : "";
-        const nearEnd = d.NearEnd ? " [NEAR END]" : "";
-        lines.push(`    ${name} (${status}) — ${orderCount} orders${training}${alcohol}${nearEnd}`);
+        const orderCount = orders.filter((o: any) => o.DriverId === d.DriverId).length;
+        const name = d.Monacher || d.FullName?.split(" ")[0] || d.DriverId.split("@")[0];
+        const flags = [
+          d.TrainingOrders > 0 ? `trainee(${d.TrainingOrders})` : "",
+          d.Alcohol ? "smartserve" : "",
+          d.NearEnd ? "NEAR-END" : "",
+        ].filter(Boolean).join(", ");
+        lines.push(`  ${name}: ${status}, ${orderCount} orders${flags ? ` [${flags}]` : ""}`);
       }
-    }
 
-    // Orders in this zone
-    if (zoneOrders.length > 0) {
-      lines.push(`  Orders:`);
-      for (const o of zoneOrders) {
+      for (const o of orders) {
         const readyTime = o.OrderReadyTime ? new Date(o.OrderReadyTime * 1000) : null;
-        const readyStr = formatTime(readyTime);
-        const readyAgo = minutesAgo(readyTime);
-        const driverName = zoneDrivers.find((d: any) => d.DriverId === o.DriverId)?.Monacher
-          || zoneDrivers.find((d: any) => d.DriverId === o.DriverId)?.FullName
-          || (o.DriverId ? o.DriverId.split("@")[0] : "UNASSIGNED");
-        const restaurant = o.RestaurantName || "Unknown";
-        const status = o.OrderStatus || "?";
-        const customer = o.DeliveryStreet ? `${o.DeliveryStreet}, ${o.DeliveryCity || ""}` : "no address";
-        const isLate = readyTime && readyTime.getTime() < Date.now() && !["InTransit", "Delivered"].includes(status);
-        const lateFlag = isLate ? " ⚠️ LATE" : "";
-        const unconfirmed = !o.DeliveryConfirmed && status === "Placed" ? " [UNCONFIRMED]" : "";
+        const driver = drivers.find((d: any) => d.DriverId === o.DriverId);
+        const driverName = driver?.Monacher || driver?.FullName?.split(" ")[0] || (o.DriverId ? o.DriverId.split("@")[0] : "UNASSIGNED");
+        const isLate = readyTime && readyTime.getTime() < Date.now() && !["InTransit"].includes(o.OrderStatus);
         const alcohol = o.Alcohol ? " [ALCOHOL]" : "";
-
-        lines.push(`    ${o.OrderIdKey} | ${status}${lateFlag}${unconfirmed}${alcohol} | ${restaurant} → ${customer} | Driver: ${driverName} | Ready: ${readyStr} (${readyAgo})`);
+        lines.push(`  Order ${o.OrderIdKey}: ${o.OrderStatus}${isLate ? " ⚠️LATE" : ""}${alcohol} | ${o.RestaurantName} → ${o.DeliveryStreet || "?"}, ${o.DeliveryCity || ""} | Driver: ${driverName} | Ready: ${formatTime(readyTime)} (${minutesAgo(readyTime)})`);
       }
+      lines.push(``);
     }
 
+    // Markets with no drivers but active demand
+    const noDriverMarkets = zones.filter((z) => {
+      const zd = dispatchData[z];
+      return (zd.Drivers?.length ?? 0) === 0 && (zd.Meter?.idealDrivers ?? 0) > 0;
+    });
+    if (noDriverMarkets.length > 0) {
+      lines.push(`⚠️ NO DRIVERS: ${noDriverMarkets.join(", ")}`);
+      lines.push(``);
+    }
+  } else if (!changes.hasChanges) {
+    lines.push(`No changes since last cycle. All markets stable.`);
+    return lines.join("\n");
+  } else {
+    // Subsequent cycles — only report what changed
+    lines.push(`CHANGES DETECTED — ${new Date().toLocaleTimeString("en-US", { timeZone: "America/Toronto" })}`);
     lines.push(``);
-  }
 
-  // ── Markets with no orders but critical scores ──
-  const criticalEmpty = zones.filter((z) => {
-    const zd = dispatchData[z];
-    return (zd.Orders?.length ?? 0) === 0 && (zd.Drivers?.length ?? 0) === 0 && (zd.Meter?.Score ?? 0) >= 80;
-  });
-  if (criticalEmpty.length > 0) {
-    lines.push(`── CRITICAL: No drivers or orders ──`);
-    for (const z of criticalEmpty) {
-      lines.push(`  ${z}: Score ${dispatchData[z].Meter?.Score}, needs ${dispatchData[z].Meter?.idealDrivers} drivers`);
+    for (const change of changes.details) {
+      const prefix = change.zone ? `[${change.zone}] ` : "";
+      lines.push(`• ${prefix}${change.description}`);
     }
     lines.push(``);
-  }
 
-  // ── Summary stats ──
-  lines.push(`── Summary ──`);
-  lines.push(`  Total: ${allOrders.length} orders, ${allDrivers.length} drivers across ${zones.length} markets`);
-  const unassigned = allOrders.filter((o) => !o.driverId);
-  if (unassigned.length > 0) {
-    lines.push(`  ⚠️ ${unassigned.length} orders have no driver assigned`);
-  }
+    // Include current state of affected zones only
+    const affectedZones = new Set(changes.details.map((d) => d.zone).filter(Boolean));
+    for (const zone of affectedZones) {
+      const zd = dispatchData[zone!];
+      if (!zd) continue;
+      const orders = zd.Orders ?? [];
+      const drivers = zd.Drivers ?? [];
+      const meter = zd.Meter;
+      const onShift = drivers.filter((d: any) => d.OnShift && !d.Paused);
 
-  // ── Events ──
-  if (events.length > 0) {
-    const dispatcher = new EventDispatcher();
-    lines.push(``);
-    lines.push(`── Events ──`);
-    for (const e of events.slice(0, 10)) {
-      lines.push(`  ${dispatcher.formatEventForAgent(e)}`);
+      lines.push(`Current state of ${zone} (${onShift.length} on-shift, ${orders.length} orders):`);
+      for (const d of drivers) {
+        const status = d.Paused ? "PAUSED" : d.OnShift ? "ON-SHIFT" : "OFF";
+        const orderCount = orders.filter((o: any) => o.DriverId === d.DriverId).length;
+        const name = d.Monacher || d.FullName?.split(" ")[0] || d.DriverId.split("@")[0];
+        lines.push(`  ${name}: ${status}, ${orderCount} orders`);
+      }
+      for (const o of orders) {
+        const readyTime = o.OrderReadyTime ? new Date(o.OrderReadyTime * 1000) : null;
+        const driver = drivers.find((d: any) => d.DriverId === o.DriverId);
+        const driverName = driver?.Monacher || driver?.FullName?.split(" ")[0] || "?";
+        const isLate = readyTime && readyTime.getTime() < Date.now() && !["InTransit"].includes(o.OrderStatus);
+        const alcohol = o.Alcohol ? " [ALCOHOL]" : "";
+        lines.push(`  Order ${o.OrderIdKey}: ${o.OrderStatus}${isLate ? " ⚠️LATE" : ""}${alcohol} | ${o.RestaurantName} | Driver: ${driverName} | Ready: ${formatTime(readyTime)} (${minutesAgo(readyTime)})`);
+      }
+      lines.push(``);
     }
   }
-
-  lines.push(``);
-  lines.push(`Analyze each market. For orders that are LATE or have issues, describe what action you would take. Be specific — use order IDs, driver names, restaurant names.`);
 
   return lines.join("\n");
 }
@@ -298,6 +408,7 @@ async function pollCycle() {
   try {
     // 1. Fetch dispatch.txt
     const data = await fetchDispatchFile();
+    previousDispatchData = latestDispatchData;
     latestDispatchData = data;
     const { orders, drivers, markets, timestamp } = parseDispatchData(data);
 
@@ -308,70 +419,78 @@ async function pollCycle() {
     currentStore.updateDrivers(drivers);
     currentStore.updateMarkets(markets);
 
-    // 3. Detect changes from previous cycle
-    const changes = detectChanges(currentStore, previousStore);
-    const hasChanges = changes.newOrders > 0 || changes.statusChanges > 0 || changes.driverChanges > 0;
+    // 3. Detect specific changes
+    const changes = detectChanges(currentStore, previousStore, latestDispatchData, previousDispatchData);
 
-    // 4. Run event detector
-    const detector = new EventDetector();
-    const events = detector.detect(currentStore, previousStore ?? undefined);
-
-    // 5. Log cycle
+    // 4. Log cycle
     const elapsed = Date.now() - cycleStart;
     const ts = new Date(timestamp * 1000).toLocaleTimeString();
 
-    if (hasChanges || events.some((e) => e.priority === "critical" || e.priority === "high")) {
-      console.log(
-        `  \x1b[33m[${ts}]\x1b[0m ` +
-        `Orders: ${orders.length} | Drivers: ${drivers.length} | ` +
-        `Changes: +${changes.newOrders} new, ${changes.statusChanges} status, ${changes.driverChanges} driver | ` +
-        `Events: ${events.length} (${events.filter((e) => e.priority === "high" || e.priority === "critical").length} urgent) | ` +
-        `${elapsed}ms`
-      );
-    } else {
-      // Quiet cycle — just a dot
+    if (changes.hasChanges) {
+      log(`  \x1b[33m[${now()}]\x1b[0m ${changes.details.length} changes | ${elapsed}ms`);
+      for (const d of changes.details) {
+        log(`    • [${now()}] ${d.description}`);
+      }
+    } else if (!isFirstCycle) {
       process.stdout.write(".");
     }
 
-    // 6. Decide whether to invoke LLM
-    const urgentEvents = events.filter((e) => e.priority === "critical" || e.priority === "high");
+    // 5. Decide whether to invoke LLM
     const timeSinceLastLlm = Date.now() - lastLlmCall;
-    const isHeartbeat = timeSinceLastLlm > HEARTBEAT_INTERVAL_MS;
-    const hasUrgent = urgentEvents.length > 0;
-    const hasSignificantChanges = changes.newOrders >= 2 || changes.statusChanges >= 3;
+    const isHeartbeat = timeSinceLastLlm > HEARTBEAT_INTERVAL_MS && !isFirstCycle;
 
     const shouldInvokeLlm =
-      (hasUrgent || hasSignificantChanges || isHeartbeat) &&
+      (isFirstCycle || changes.hasChanges || isHeartbeat) &&
       timeSinceLastLlm > LLM_COOLDOWN_MS;
 
     if (shouldInvokeLlm) {
-      const eventsForLlm = events.slice(0, 10);
-      totalEventsProcessed += eventsForLlm.length;
+      totalEventsProcessed += changes.details.length;
 
-      console.log(`\n  \x1b[36m→ Invoking LLM (${hasUrgent ? "URGENT" : isHeartbeat ? "heartbeat" : "changes"})...\x1b[0m`);
+      const reason = isFirstCycle ? "initial review" : isHeartbeat ? "heartbeat" : `${changes.details.length} changes`;
+      log(`\n  \x1b[36m[${now()}] → Invoking LLM (${reason})...\x1b[0m`);
 
-      const prompt = buildSituationReport(currentStore, latestDispatchData, eventsForLlm);
+      const prompt = buildChangesPrompt(changes, latestDispatchData, isFirstCycle);
+
+      const systemPrompt = [
+        "You are Sisyphus, an AI dispatcher for ValleyEats food delivery. You are in SHADOW MODE — you observe and analyze but do NOT take actions.",
+        "",
+        "CRITICAL RULES:",
+        "- NEVER suggest reassigning an order that is InBag or InTransit. The driver has the food. Instead: message the driver to check on them, and escalate if no response.",
+        "- Alcohol/Smart Serve only matters if the ORDER has an Alcohol flag (Alcohol: true). A restaurant being a pub/bar does NOT mean the order has alcohol. The system already prevents assigning alcohol orders to non-certified drivers.",
+        "- When an order LEAVES dispatch (disappears), it was DELIVERED/COMPLETED. This is normal — do not flag it as an issue.",
+        "- For late InTransit orders: check the order timeline to determine if the RESTAURANT caused the delay (late ready time) vs the DRIVER (not moving). If the restaurant was late, the driver is doing their best — don't blame them.",
+        "- Only suggest ReassignOrder for orders that are Placed, Confirmed, or Ready — never InBag or InTransit.",
+        "",
+        "When changes occur, analyze them and describe what you WOULD do. For EACH proposed action:",
+        "1. What changed and why it matters (include timestamp)",
+        "2. What action you would take (AssignDriverToOrder, ReassignOrder, SendDriverMessage, FlagMarketIssue, EscalateTicket, etc.)",
+        "3. Your reasoning — weigh the options. Which drivers were considered? Why pick one over another? Consider: distance, current order load, shift time remaining, trainee status.",
+        "4. What alternatives you considered and why you rejected them",
+        "",
+        "If nothing needs attention, say 'All clear — no action needed.' and briefly explain why.",
+        "Be concise but show your reasoning. A dispatcher reading this should understand WHY you chose what you chose.",
+      ].join("\n");
 
       const response = await callLlm([
-        {
-          role: "system",
-          content:
-            "You are Sisyphus, an AI dispatcher for ValleyEats. SHADOW MODE — describe what you WOULD do. " +
-            "For each action: name, parameters (IDs/names), reasoning, priority. Be concise — 2-3 sentences per action max.",
-        },
+        { role: "system", content: systemPrompt },
         { role: "user", content: prompt },
       ]);
 
       const content = response.choices[0]?.message?.content ?? "(no response)";
       lastLlmCall = Date.now();
       totalLlmCalls++;
+      isFirstCycle = false;
 
-      console.log(`  \x1b[32m── LLM Response (#${totalLlmCalls}) ──\x1b[0m`);
-      console.log(content.split("\n").map((l: string) => `  ${l}`).join("\n"));
-      console.log(`  \x1b[32m──────────────────────\x1b[0m\n`);
+      const usage = response.usage;
+      const tokens = usage ? `${usage.prompt_tokens}in/${usage.completion_tokens}out` : "?";
+      log(`  \x1b[32m── LLM Response #${totalLlmCalls} [${now()}] (${tokens}) ──\x1b[0m`);
+      log(content.split("\n").map((l: string) => `  ${l}`).join("\n"));
+      log(`  \x1b[32m──────────────────────\x1b[0m\n`);
+    } else if (isFirstCycle) {
+      isFirstCycle = false; // Even if we didn't call LLM, don't re-send full state
     }
   } catch (err: any) {
-    console.error(`  \x1b[31mError:\x1b[0m ${err.message}`);
+    log(`  \x1b[31m[${now()}] Error:\x1b[0m ${err.message}`);
   }
 }
 
@@ -379,11 +498,17 @@ async function pollCycle() {
 // Entry point
 // ---------------------------------------------------------------------------
 
-console.log("\n\x1b[1m  Sisyphus Shadow Watcher\x1b[0m");
-console.log(`  Polling dispatch.txt every ${POLL_INTERVAL_MS / 1000}s`);
-console.log(`  LLM heartbeat every ${HEARTBEAT_INTERVAL_MS / 1000}s`);
-console.log(`  LLM cooldown: ${LLM_COOLDOWN_MS / 1000}s minimum between calls`);
-console.log(`  Press Ctrl+C to stop\n`);
+logRaw(`# Sisyphus Shadow Watch — ${logDate}\n`);
+logRaw(`Model: ${process.env.LLM_MODEL}`);
+logRaw(`Started: ${now()}`);
+logRaw(`Poll interval: ${POLL_INTERVAL_MS / 1000}s | Heartbeat: ${HEARTBEAT_INTERVAL_MS / 1000}s`);
+logRaw(`Log file: ${LOG_FILE}\n---\n`);
+
+log("\n\x1b[1m  Sisyphus Shadow Watcher\x1b[0m");
+log(`  Model: ${process.env.LLM_MODEL}`);
+log(`  Log file: ${LOG_FILE}`);
+log(`  Polling every ${POLL_INTERVAL_MS / 1000}s | Heartbeat every ${HEARTBEAT_INTERVAL_MS / 1000}s`);
+log(`  Press Ctrl+C to stop\n`);
 
 // Run immediately, then on interval
 await pollCycle();
@@ -394,13 +519,17 @@ process.on("SIGINT", () => {
   clearInterval(interval);
   const duration = ((Date.now() - startTime) / 1000 / 60).toFixed(1);
   const usage = tokenTracker.getSummary();
-  console.log(`\n\n\x1b[1m  Shadow Watcher Summary\x1b[0m`);
-  console.log(`  Duration: ${duration} minutes`);
-  console.log(`  Cycles: ${cycleCount}`);
-  console.log(`  LLM calls: ${totalLlmCalls}`);
-  console.log(`  Events processed: ${totalEventsProcessed}`);
-  console.log(`  Tokens: ${usage.totalInput + usage.totalOutput} total`);
-  console.log(`  Est. cost: $${tokenTracker.estimateCost().toFixed(4)}`);
-  console.log("");
+  const summary = [
+    `\n---\n## Summary`,
+    `Stopped: ${now()}`,
+    `Duration: ${duration} minutes`,
+    `Cycles: ${cycleCount}`,
+    `LLM calls: ${totalLlmCalls}`,
+    `Events processed: ${totalEventsProcessed}`,
+    `Tokens: ${usage.totalInput + usage.totalOutput} total`,
+    `Est. cost: $${tokenTracker.estimateCost().toFixed(4)}`,
+  ].join("\n");
+  log(`\n\x1b[1m${summary}\x1b[0m\n`);
+  logRaw(summary);
   process.exit(0);
 });
