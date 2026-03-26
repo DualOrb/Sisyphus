@@ -90,6 +90,21 @@ export function createAgentNode(
     while (iterations < maxIterations) {
       iterations += 1;
 
+      // When one iteration remains, inject a system message forcing the
+      // agent to summarise rather than making more tool calls. This
+      // prevents messy cut-offs when hitting the iteration limit.
+      if (iterations >= maxIterations) {
+        currentMessages = [
+          ...currentMessages,
+          new SystemMessage(
+            "You are on your FINAL iteration and will not get another turn. " +
+            "Do NOT make any more tool calls. Instead, provide a brief summary of " +
+            "what you have found so far and what actions you recommend. " +
+            "Be concise and actionable.",
+          ),
+        ];
+      }
+
       // Call the LLM
       const response = await modelWithTools.invoke(currentMessages);
 

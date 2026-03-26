@@ -1,7 +1,7 @@
 /**
  * Shadow Live Watcher — full infrastructure pipeline.
  *
- * Unlike shadow-watch.ts which makes raw LLM calls, this script wires
+ * This script wires
  * the REAL Sisyphus pipeline end-to-end:
  *
  *   OntologyStore -> EventDetector -> EventQueue -> EventDispatcher
@@ -23,7 +23,7 @@ import { unmarshall } from "@aws-sdk/util-dynamodb";
 import { mkdirSync, appendFileSync } from "node:fs";
 import { resolve } from "node:path";
 import { randomUUID } from "node:crypto";
-import { HumanMessage } from "@langchain/core/messages";
+import { HumanMessage, AIMessage } from "@langchain/core/messages";
 import { StateGraph, START, END, MemorySaver } from "@langchain/langgraph";
 import { DynamicStructuredTool } from "@langchain/core/tools";
 import { z } from "zod";
@@ -185,7 +185,7 @@ async function fetchRelevantTickets(): Promise<any[]> {
 }
 
 // ---------------------------------------------------------------------------
-// Dispatch data parser (copied from shadow-watch.ts)
+// Dispatch data parser
 // ---------------------------------------------------------------------------
 
 const EXCLUDED_RESTAURANTS = new Set([
@@ -258,7 +258,7 @@ function parseDispatchData(data: any): {
 }
 
 // ---------------------------------------------------------------------------
-// Change detection (copied from shadow-watch.ts)
+// Change detection
 // ---------------------------------------------------------------------------
 
 interface ChangeDetail {
@@ -774,6 +774,86 @@ const startTime = Date.now();
 // to prevent unbounded message history accumulation across cycles.
 const sessionShiftId = randomUUID();
 
+/**
+ * Rolling context summary from the previous cycle.
+ * Prepended to the next cycle's HumanMessage so the AI retains
+ * awareness of its prior decisions across fresh thread_ids.
+ * @see planning/04-memory-system.md — Layer 1 "Working Memory"
+ */
+let cycleSummary = "";
+
+// ---------------------------------------------------------------------------
+// Rolling context: extract a brief summary from the last AI response
+// ---------------------------------------------------------------------------
+
+/**
+ * Extract a short summary (max 500 chars) from the last AIMessage content.
+ * Takes the first paragraph or the first 500 characters, whichever is shorter.
+ */
+function extractCycleSummary(messages: any[]): string {
+  // Walk backwards to find the last AIMessage with text content
+  for (let i = messages.length - 1; i >= 0; i--) {
+    const msg = messages[i];
+    const isAi =
+      msg instanceof AIMessage ||
+      msg._getType?.() === "ai" ||
+      msg.constructor?.name === "AIMessage";
+    if (!isAi) continue;
+
+    const raw =
+      typeof msg.content === "string"
+        ? msg.content
+        : Array.isArray(msg.content)
+          ? msg.content.map((c: any) => (typeof c === "string" ? c : c.text ?? "")).join(" ")
+          : "";
+    if (!raw) continue;
+
+    // First paragraph = up to the first blank line
+    const firstParagraph = raw.split(/\n\s*\n/)[0]?.trim() ?? raw.trim();
+    return firstParagraph.slice(0, 500);
+  }
+  return "";
+}
+
+// ---------------------------------------------------------------------------
+// Focus areas: tell the supervisor what types of issues are currently relevant
+// ---------------------------------------------------------------------------
+
+/**
+ * Build a "FOCUS AREAS" section based on the current ontology state.
+ * This acts as a lightweight alternative to filtering process files:
+ * the graph is built once with all process files, but each cycle's
+ * HumanMessage tells the supervisor what to pay attention to.
+ */
+function buildFocusAreas(store: OntologyStore): string {
+  const activeOrders = store.orders.size;
+  const openTickets = store.tickets.size;
+  const allDrivers = [...store.drivers.values()];
+  const driversOnShift = allDrivers.filter((d) => d.onShift && !d.paused).length;
+  const activeMarkets = [...store.markets.values()].filter(
+    (m) => allDrivers.some((d) => d.dispatchZone === m.market && d.onShift),
+  ).length;
+
+  const focusList: string[] = [];
+
+  if (activeOrders > 0) focusList.push("order monitoring & assignment");
+  if (openTickets > 0) focusList.push("ticket resolution");
+  if (driversOnShift > 0) focusList.push("driver communication & scheduling");
+  if (activeMarkets > 0) focusList.push("market health monitoring");
+  if (focusList.length === 0) focusList.push("general oversight (quiet period)");
+
+  const lines = [
+    `\n-- FOCUS AREAS --`,
+    `Active orders: ${activeOrders > 0 ? `yes (${activeOrders})` : "no"}`,
+    `Open tickets: ${openTickets > 0 ? `yes (${openTickets})` : "no"}`,
+    `Drivers on shift: ${driversOnShift}`,
+    `Active markets with drivers: ${activeMarkets}`,
+    `Focus on: ${focusList.join(", ")}`,
+  ];
+
+  return lines.join("\n");
+}
+
 // ---------------------------------------------------------------------------
 // Graph builder (custom version that injects our onAudit into tools)
 // ---------------------------------------------------------------------------
@@ -1088,6 +1168,15 @@ async function pollCycle(infra: Awaited<ReturnType<typeof initialize>>) {
         }
       }
 
+      // Prepend rolling context summary from previous cycle (if any)
+      if (cycleSummary) {
+        combinedPrompt =
+          `PREVIOUS CYCLE SUMMARY: ${cycleSummary}\n\n` + combinedPrompt;
+      }
+
+      // Append focus areas so the supervisor knows what to prioritize
+      combinedPrompt += buildFocusAreas(ontologyStore);
+
       // Log the prompt to the report
       logRaw(`\n## Cycle ${cycleCount} [${now()}] -- ${reason}\n`);
       logRaw(`### Prompt sent to LangGraph\n\`\`\`\n${combinedPrompt}\n\`\`\`\n`);
@@ -1109,6 +1198,9 @@ async function pollCycle(infra: Awaited<ReturnType<typeof initialize>>) {
 
         // Extract messages from the result
         const messages = (result as any)?.messages ?? [];
+
+        // Update rolling context summary for next cycle
+        cycleSummary = extractCycleSummary(messages);
         const aiMessages = messages.filter(
           (m: any) => m._getType?.() === "ai" || m.constructor?.name === "AIMessage",
         );
