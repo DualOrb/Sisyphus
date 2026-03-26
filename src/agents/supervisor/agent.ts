@@ -115,9 +115,15 @@ export function createSupervisorNode(
 
 You manage the following sub-agents: ${agentMembersStr}.
 
-After analyzing the current situation, you MUST call the "route_to_agent" tool to indicate which sub-agent should act next. If all current tasks are handled and there is nothing urgent, route to "__end__".
+**CRITICAL ROUTING RULE:** Your primary job is to make a routing decision. You may use ontology tools briefly to gather essential context, but you MUST call "route_to_agent" within your first few tool calls. Do NOT spend multiple rounds investigating — gather what you need quickly, then route.
 
-You may use ontology tools (query_orders, query_drivers, query_tickets, get_order_details, get_entity_timeline, execute_action, request_clarification) to gather information before making your routing decision. But you MUST eventually call "route_to_agent" to indicate your decision.
+After investigating (1-2 tool calls at most), you MUST call "route_to_agent" on your very next turn to either:
+- Delegate to the appropriate sub-agent, OR
+- Route to "__end__" if the situation is stable and no action is needed.
+
+Calling "__end__" is a perfectly valid routing decision when everything looks normal. Do NOT keep investigating just to be thorough — make a decision and route.
+
+You may use ontology tools (query_orders, query_drivers, query_tickets, get_order_details, get_entity_timeline, execute_action, request_clarification) to gather information before making your routing decision.
 
 ### Agent Responsibilities:
 - **market_monitor** — Market health, driver/order ratios, proactive alerts, zone monitoring
@@ -147,9 +153,19 @@ You may use ontology tools (query_orders, query_drivers, query_tickets, get_orde
     let currentMessages = inputMessages;
 
     // Allow the supervisor a few iterations to investigate before routing
-    const maxIterations = 5;
+    const maxIterations = 10;
 
     for (let i = 0; i < maxIterations; i++) {
+      // After 3+ iterations without routing, nudge the LLM to make a decision
+      if (i >= 3) {
+        const nudge = new SystemMessage(
+          `[SYSTEM] You have used ${i} investigation rounds without making a routing decision. ` +
+          `You MUST call "route_to_agent" NOW to either delegate to a sub-agent or route to "__end__". ` +
+          `Do not call any more ontology tools — make your routing decision immediately.`,
+        );
+        currentMessages = [...currentMessages, nudge];
+      }
+
       // Debug: log what we're sending to the LLM
       log.info({
         iteration: i,

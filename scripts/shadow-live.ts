@@ -18,6 +18,8 @@
 
 import "dotenv/config";
 import { S3Client, GetObjectCommand } from "@aws-sdk/client-s3";
+import { DynamoDBClient, QueryCommand } from "@aws-sdk/client-dynamodb";
+import { unmarshall } from "@aws-sdk/util-dynamodb";
 import { mkdirSync, appendFileSync } from "node:fs";
 import { resolve } from "node:path";
 import { randomUUID } from "node:crypto";
@@ -32,6 +34,7 @@ import {
   transformOrder,
   transformDriver,
   transformMarket,
+  transformTicket,
 } from "../src/ontology/sync/transformer.js";
 import { EventDetector } from "../src/events/detector.js";
 import { EventQueue } from "../src/events/queue.js";
@@ -129,6 +132,7 @@ function logRaw(text: string) {
 // ---------------------------------------------------------------------------
 
 const s3 = new S3Client({ region: REGION });
+const dynamo = new DynamoDBClient({ region: REGION });
 
 async function fetchDispatchFile(): Promise<any> {
   const result = await s3.send(
@@ -137,6 +141,40 @@ async function fetchDispatchFile(): Promise<any> {
   const body = await result.Body?.transformToString();
   if (!body) throw new Error("Empty dispatch.txt");
   return JSON.parse(body);
+}
+
+// ---------------------------------------------------------------------------
+// DynamoDB: fetch open tickets from IssueTracker
+// ---------------------------------------------------------------------------
+
+async function fetchOpenTickets(): Promise<any[]> {
+  const tickets: any[] = [];
+
+  for (const status of ["New", "Pending"]) {
+    try {
+      const result = await dynamo.send(
+        new QueryCommand({
+          TableName: "ValleyEats-IssueTracker",
+          IndexName: "IssueStatus-Created-index",
+          KeyConditionExpression: "IssueStatus = :s",
+          ExpressionAttributeValues: { ":s": { S: status } },
+          Limit: 50,
+          ScanIndexForward: false, // newest first
+        }),
+      );
+      if (result.Items) {
+        for (const item of result.Items) {
+          try {
+            tickets.push(transformTicket(unmarshall(item)));
+          } catch { /* skip bad records */ }
+        }
+      }
+    } catch (err: any) {
+      log.warn({ err: err.message, status }, "Failed to query DynamoDB tickets");
+    }
+  }
+
+  return tickets;
 }
 
 // ---------------------------------------------------------------------------
@@ -725,7 +763,8 @@ let latestDispatchData: any = null;
 let previousDispatchData: any = null;
 let isFirstCycle = true;
 const startTime = Date.now();
-const sessionThreadId = `shadow-live-${Date.now()}`;
+// NOTE: thread IDs are now generated per-cycle (see graph.invoke below)
+// to prevent unbounded message history accumulation across cycles.
 const sessionShiftId = randomUUID();
 
 // ---------------------------------------------------------------------------
@@ -928,6 +967,19 @@ async function pollCycle(infra: Awaited<ReturnType<typeof initialize>>) {
     ontologyStore.updateDrivers(drivers);
     ontologyStore.updateMarkets(markets);
 
+    // 2b. Sync tickets from DynamoDB every 3rd cycle (~60s) or on first cycle
+    if (isFirstCycle || cycleCount % 3 === 0) {
+      try {
+        const tickets = await fetchOpenTickets();
+        ontologyStore.updateTickets(tickets);
+        if (tickets.length > 0) {
+          logConsole(`  [${now()}] Synced ${tickets.length} open ticket(s) from DynamoDB`);
+        }
+      } catch (err: any) {
+        log.warn({ err: err.message }, "Ticket sync failed -- continuing with stale ticket data");
+      }
+    }
+
     // 3. Cross-reference: compute activeOrdersCount per driver
     for (const driver of ontologyStore.queryDrivers({})) {
       const driverOrders = ontologyStore.queryOrders({ driverId: driver.driverId });
@@ -958,6 +1010,7 @@ async function pollCycle(infra: Awaited<ReturnType<typeof initialize>>) {
     previousStore.updateOrders([...ontologyStore.orders.values()]);
     previousStore.updateDrivers([...ontologyStore.drivers.values()]);
     previousStore.updateMarkets([...ontologyStore.markets.values()]);
+    previousStore.updateTickets([...ontologyStore.tickets.values()]);
 
     // 6. Convert raw changes into PrioritizedEvents and enqueue
     const changeEvents = changesToEvents(changes);
@@ -995,7 +1048,20 @@ async function pollCycle(infra: Awaited<ReturnType<typeof initialize>>) {
       logConsole(`\n  \x1b[36m[${now()}] -> Invoking LangGraph dispatch graph (${reason})...\x1b[0m`);
 
       // Build the situation prompt
-      const situationPrompt = buildChangesPrompt(changes, latestDispatchData, isFirstCycle);
+      let situationPrompt = buildChangesPrompt(changes, latestDispatchData, isFirstCycle);
+
+      // Append open ticket summary
+      const ticketCount = ontologyStore.tickets.size;
+      if (ticketCount > 0) {
+        const ticketLines: string[] = [`\n-- Open Tickets (${ticketCount}) --`];
+        for (const t of ontologyStore.tickets.values()) {
+          const age = Math.round((Date.now() - t.createdAt.getTime()) / 60000);
+          ticketLines.push(
+            `  ${t.issueId}: [${t.status}] ${t.category} / ${t.issueType} -- ${t.restaurantName ?? t.originator} (${age}m old)`,
+          );
+        }
+        situationPrompt += "\n" + ticketLines.join("\n") + "\n";
+      }
 
       // Append event-pipeline formatted message if there are queued events
       let combinedPrompt = situationPrompt;
@@ -1019,11 +1085,15 @@ async function pollCycle(infra: Awaited<ReturnType<typeof initialize>>) {
       logRaw(`\n## Cycle ${cycleCount} [${now()}] -- ${reason}\n`);
       logRaw(`### Prompt sent to LangGraph\n\`\`\`\n${combinedPrompt}\n\`\`\`\n`);
 
-      // Invoke the LangGraph graph
+      // Invoke the LangGraph graph with a fresh thread_id per cycle.
+      // Each cycle's HumanMessage already contains the full current state,
+      // so we don't need conversation history from prior cycles. A fresh
+      // thread prevents MemorySaver from accumulating unbounded messages.
+      const cycleThreadId = `shadow-live-cycle-${cycleCount}-${Date.now()}`;
       try {
         const result = await graph.invoke(
           { messages: [new HumanMessage(combinedPrompt)] },
-          { configurable: { thread_id: sessionThreadId } },
+          { configurable: { thread_id: cycleThreadId } },
         );
 
         lastLlmCall = Date.now();

@@ -95,6 +95,40 @@ async function fetchDispatchFile(): Promise<any> {
 }
 
 // ---------------------------------------------------------------------------
+// DynamoDB: fetch open tickets from IssueTracker
+// ---------------------------------------------------------------------------
+
+async function fetchOpenTickets(): Promise<any[]> {
+  const tickets: any[] = [];
+
+  for (const status of ["New", "Pending"]) {
+    try {
+      const result = await dynamo.send(
+        new QueryCommand({
+          TableName: "ValleyEats-IssueTracker",
+          IndexName: "IssueStatus-Created-index",
+          KeyConditionExpression: "IssueStatus = :s",
+          ExpressionAttributeValues: { ":s": { S: status } },
+          Limit: 50,
+          ScanIndexForward: false, // newest first
+        }),
+      );
+      if (result.Items) {
+        for (const item of result.Items) {
+          try {
+            tickets.push(transformTicket(unmarshall(item)));
+          } catch { /* skip bad records */ }
+        }
+      }
+    } catch (err: any) {
+      log(`  \x1b[33m[${now()}] Warning: Failed to query DynamoDB tickets (${status}): ${err.message}\x1b[0m`);
+    }
+  }
+
+  return tickets;
+}
+
+// ---------------------------------------------------------------------------
 // Parse dispatch.txt into ontology objects
 // ---------------------------------------------------------------------------
 
@@ -419,6 +453,22 @@ async function pollCycle() {
     currentStore.updateDrivers(drivers);
     currentStore.updateMarkets(markets);
 
+    // 2b. Sync tickets from DynamoDB every 3rd cycle (~60s) or on first cycle
+    if (isFirstCycle || cycleCount % 3 === 0) {
+      try {
+        const tickets = await fetchOpenTickets();
+        currentStore.updateTickets(tickets);
+        if (tickets.length > 0) {
+          log(`  [${now()}] Synced ${tickets.length} open ticket(s) from DynamoDB`);
+        }
+      } catch (err: any) {
+        log(`  \x1b[33m[${now()}] Warning: Ticket sync failed -- continuing with 0 tickets: ${err.message}\x1b[0m`);
+      }
+    } else if (previousStore) {
+      // Carry forward tickets from previous cycle on non-sync cycles
+      currentStore.updateTickets([...previousStore.tickets.values()]);
+    }
+
     // 3. Detect specific changes
     const changes = detectChanges(currentStore, previousStore, latestDispatchData, previousDispatchData);
 
@@ -449,7 +499,20 @@ async function pollCycle() {
       const reason = isFirstCycle ? "initial review" : isHeartbeat ? "heartbeat" : `${changes.details.length} changes`;
       log(`\n  \x1b[36m[${now()}] → Invoking LLM (${reason})...\x1b[0m`);
 
-      const prompt = buildChangesPrompt(changes, latestDispatchData, isFirstCycle);
+      let prompt = buildChangesPrompt(changes, latestDispatchData, isFirstCycle);
+
+      // Append open ticket summary to the situation report
+      const ticketCount = currentStore.tickets.size;
+      if (ticketCount > 0) {
+        const ticketLines: string[] = [`\n── Open Tickets (${ticketCount}) ──`];
+        for (const t of currentStore.tickets.values()) {
+          const age = Math.round((Date.now() - t.createdAt.getTime()) / 60000);
+          ticketLines.push(
+            `  ${t.issueId}: [${t.status}] ${t.category} / ${t.issueType} — ${t.restaurantName ?? t.originator} (${age}m old)`,
+          );
+        }
+        prompt += "\n" + ticketLines.join("\n") + "\n";
+      }
 
       const systemPrompt = [
         "You are Sisyphus, an AI dispatcher for ValleyEats food delivery. You are in SHADOW MODE — you observe and analyze but do NOT take actions.",
