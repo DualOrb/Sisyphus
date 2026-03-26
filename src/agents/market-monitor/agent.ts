@@ -60,6 +60,7 @@ const ALLOWED_TOOL_NAMES = new Set([
   "query_drivers",
   "get_entity_timeline",
   "execute_action",
+  "lookup_process",
 ]);
 
 /**

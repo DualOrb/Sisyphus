@@ -75,6 +75,7 @@ const ALLOWED_TOOL_NAMES = new Set([
   "get_entity_timeline",
   "execute_action",
   "request_clarification",
+  "lookup_process",
 ]);
 
 /**

@@ -210,7 +210,147 @@ export function buildSystemPrompt(
     }
   }
 
-  return sections.join("\n\n");
+  const joined = sections.join("\n\n");
+
+  // No truncation — the caller is responsible for passing a curated set of
+  // processes (e.g. via selectRelevantProcesses or a manual base set).
+  // Agents can fetch additional processes on demand via the lookup_process tool.
+
+  return joined;
+}
+
+// ---------------------------------------------------------------------------
+// Context-aware process selection
+// ---------------------------------------------------------------------------
+
+/** Operational context flags used to decide which process files are relevant. */
+export interface ProcessSelectionContext {
+  hasActiveOrders: boolean;
+  hasOpenTickets: boolean;
+  hasDriversOnShift: boolean;
+  hasLateOrders: boolean;
+  hasNewMessages: boolean;
+}
+
+/**
+ * Priority ordering used to cap the result set: critical files first.
+ */
+const PRIORITY_RANK: Record<string, number> = {
+  critical: 0,
+  high: 1,
+  normal: 2,
+  low: 3,
+};
+
+/**
+ * Select a small, high-signal set of process files for a given agent and
+ * operational context. Designed for use as the "base prompt" — agents can
+ * pull in additional procedures on demand via the `lookup_process` tool.
+ *
+ * Selection rules:
+ *   - ALWAYS include AGENTS.md (trigger: "system", agent: "all")
+ *   - Include the agent's core communication/tone file (trigger starts with "always_")
+ *   - Contextually include files matching active operational conditions
+ *   - Cap at 8 files, prioritised by: critical > high > normal > low
+ */
+export function selectRelevantProcesses(
+  processes: ProcessFile[],
+  agentName: string,
+  context: ProcessSelectionContext,
+): ProcessFile[] {
+  // Start with processes relevant to this agent (or agent="all")
+  const agentProcesses = processes.filter(
+    (p) => p.agent === agentName || p.agent === "all",
+  );
+
+  const selected = new Set<ProcessFile>();
+
+  // 1. ALWAYS include AGENTS.md (system trigger, agent="all")
+  for (const p of agentProcesses) {
+    if (p.trigger === "system" && p.agent === "all") {
+      selected.add(p);
+    }
+  }
+
+  // 2. Always include "always_*" trigger files (tone, guidelines, best practices)
+  for (const p of agentProcesses) {
+    if (p.trigger.startsWith("always_")) {
+      selected.add(p);
+    }
+  }
+
+  // 3. Contextual inclusion by keyword matching on trigger and filename
+  const contextKeywords: string[] = [];
+
+  if (context.hasActiveOrders) {
+    contextKeywords.push(
+      "order_status_change", "driver_assignment", "order_management",
+      "reassignment_consideration", "order_reassignment",
+      "routing_unassigned", "routing_overloaded", "routing_non_optimal",
+      "new_event", "triage",
+    );
+  }
+
+  if (context.hasOpenTickets) {
+    contextKeywords.push(
+      "new_ticket", "ticket_resolution", "ticket_classification",
+      "ticket_type", "refund_decision", "credits",
+      "ticket_assigned", "ticket_created", "escalation_check",
+    );
+  }
+
+  if (context.hasLateOrders) {
+    contextKeywords.push(
+      "ticket_type_late", "late_delivery", "courier_will_be_late",
+      "courier_running_late", "driver_unresponsive", "no_response",
+      "scenario_late_pickup", "scenario_delayed", "market_health_degraded",
+      "running_behind",
+    );
+  }
+
+  if (context.hasNewMessages) {
+    contextKeywords.push(
+      "new_driver_message", "driver_messaging",
+      "communication", "comms_guidelines",
+    );
+  }
+
+  if (context.hasDriversOnShift) {
+    contextKeywords.push(
+      "courier_best_practices", "utilization_check",
+      "courier_utilization", "shift_start", "shift_end",
+    );
+  }
+
+  // Match against trigger values and filename keywords
+  for (const p of agentProcesses) {
+    const triggerLower = p.trigger.toLowerCase();
+    const fileNameLower = p.filePath.toLowerCase();
+
+    for (const keyword of contextKeywords) {
+      if (triggerLower.includes(keyword) || fileNameLower.includes(keyword.replace(/_/g, "-"))) {
+        selected.add(p);
+        break;
+      }
+    }
+  }
+
+  // 4. Sort by priority and cap at 8
+  const sorted = [...selected].sort(
+    (a, b) => (PRIORITY_RANK[a.priority] ?? 99) - (PRIORITY_RANK[b.priority] ?? 99),
+  );
+
+  const MAX_BASE_FILES = 8;
+  if (sorted.length > MAX_BASE_FILES) {
+    log.info(
+      { agentName, totalSelected: sorted.length, capped: MAX_BASE_FILES },
+      "Capping base process files from %d to %d",
+      sorted.length,
+      MAX_BASE_FILES,
+    );
+  }
+
+  return sorted.slice(0, MAX_BASE_FILES);
 }
 
 // ---------------------------------------------------------------------------

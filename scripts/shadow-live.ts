@@ -69,7 +69,9 @@ import { createOntologyTools } from "../src/tools/ontology-tools.js";
 import {
   loadProcessDirectory,
   buildSystemPrompt,
+  selectRelevantProcesses,
 } from "../src/tools/process-loader.js";
+import { createProcessTools } from "../src/tools/process-tools.js";
 import { executeAction } from "../src/guardrails/executor.js";
 import type { ExecutionContext, AuditRecord } from "../src/guardrails/types.js";
 import { registerAllActions } from "../src/ontology/actions/index.js";
@@ -622,6 +624,8 @@ function createCustomExecuteActionTool(
   db: PostgresDb,
   sessionShiftId: string,
   agentId: string,
+  shadowExecutor: ShadowExecutor,
+  shadowMetrics: ShadowMetrics,
 ): DynamicStructuredTool {
   return new DynamicStructuredTool({
     name: "execute_action",
@@ -643,7 +647,7 @@ function createCustomExecuteActionTool(
       try {
         const executionContext: ExecutionContext = {
           redis,
-          state: buildWorldState(store),
+          state: store as unknown as Record<string, unknown>,
           correlationId: sessionShiftId,
           llmModel: process.env.LLM_MODEL ?? "unknown",
           llmTokensUsed: 0,
@@ -698,6 +702,19 @@ function createCustomExecuteActionTool(
             logConsole(
               `    ${outcomeColor}AUDIT: ${record.actionType} -> ${record.outcome}\x1b[0m (${record.executionTimeMs}ms)`,
             );
+
+            // 4. Record shadow proposal for executed/staged actions
+            if (record.outcome === "executed" || record.outcome === "staged") {
+              shadowExecutor.setContext({
+                tier: "YELLOW",
+                reasoning: record.reasoning,
+                agentId: record.agentId,
+                validationResult: {
+                  passed: record.outcome !== "rejected",
+                },
+              });
+              await shadowExecutor.execute(record.actionType, record.params);
+            }
           },
         };
 
@@ -870,24 +887,58 @@ async function buildGraphWithCustomTools(
   store: OntologyStore,
   redis: import("ioredis").Redis,
   db: PostgresDb,
+  shadowExecutor: ShadowExecutor,
+  shadowMetrics: ShadowMetrics,
 ) {
   // 1. Load process files
   log.info({ processDir: PROCESS_DIR }, "Loading process files");
   const processes = await loadProcessDirectory(PROCESS_DIR);
   log.info({ count: processes.length }, "Process files loaded");
 
-  const supervisorPrompt = buildSystemPrompt("supervisor", processes);
-  const marketMonitorPrompt = buildSystemPrompt("market-monitor", processes);
-  const driverCommsPrompt = buildSystemPrompt("driver-comms", processes);
-  const customerSupportPrompt = buildSystemPrompt("customer-support", processes);
-  const taskExecutorPrompt = buildSystemPrompt("task-executor", processes);
+  // Build base-set prompts per agent: AGENTS.md + 2-3 most important agent-specific files.
+  // The full process library is available on-demand via the lookup_process tool.
+  const defaultContext = {
+    hasActiveOrders: true,
+    hasOpenTickets: true,
+    hasDriversOnShift: true,
+    hasLateOrders: true,
+    hasNewMessages: true,
+  };
+
+  const supervisorBase = selectRelevantProcesses(processes, "supervisor", defaultContext);
+  const marketMonitorBase = selectRelevantProcesses(processes, "market-monitor", defaultContext);
+  const driverCommsBase = selectRelevantProcesses(processes, "driver-comms", defaultContext);
+  const customerSupportBase = selectRelevantProcesses(processes, "customer-support", defaultContext);
+  const taskExecutorBase = selectRelevantProcesses(processes, "task-executor", defaultContext);
+
+  log.info(
+    {
+      supervisor: supervisorBase.length,
+      marketMonitor: marketMonitorBase.length,
+      driverComms: driverCommsBase.length,
+      customerSupport: customerSupportBase.length,
+      taskExecutor: taskExecutorBase.length,
+      totalLibrary: processes.length,
+    },
+    "Base process files selected per agent (full library available via lookup_process tool)",
+  );
+
+  const supervisorPrompt = buildSystemPrompt("supervisor", supervisorBase);
+  const marketMonitorPrompt = buildSystemPrompt("market-monitor", marketMonitorBase);
+  const driverCommsPrompt = buildSystemPrompt("driver-comms", driverCommsBase);
+  const customerSupportPrompt = buildSystemPrompt("customer-support", customerSupportBase);
+  const taskExecutorPrompt = buildSystemPrompt("task-executor", taskExecutorBase);
 
   // 2. Create ontology tools, then replace execute_action with our custom version
   const baseTools: DynamicStructuredTool[] = createOntologyTools(store, redis, "sisyphus");
 
   // Remove the default execute_action tool and add our custom one
   const allTools = baseTools.filter((t) => t.name !== "execute_action");
-  allTools.push(createCustomExecuteActionTool(store, redis, db, sessionShiftId, "sisyphus"));
+  allTools.push(createCustomExecuteActionTool(store, redis, db, sessionShiftId, "sisyphus", shadowExecutor, shadowMetrics));
+
+  // Add process retrieval tools — agents can search the full library on demand
+  const processTools = createProcessTools(processes);
+  allTools.push(...processTools);
 
   // 3. Create LLM instances
   const defaultModel = createChatModel();
@@ -1012,7 +1063,7 @@ async function initialize() {
   logConsole(`  [${now()}] Building LangGraph dispatch graph...`);
   logConsole(`  [${now()}] Loading process files from ${PROCESS_DIR}...`);
 
-  const graph = await buildGraphWithCustomTools(ontologyStore, redis, db);
+  const graph = await buildGraphWithCustomTools(ontologyStore, redis, db, shadowExecutor, shadowMetrics);
 
   logConsole(`  [${now()}] LangGraph dispatch graph compiled`);
 

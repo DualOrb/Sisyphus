@@ -84,6 +84,9 @@ export function createAgentNode(
     let needsEscalation = false;
     let escalationReason = "";
 
+    // Cache for deduplicating repeated tool calls within this invocation
+    const toolCallCache = new Map<string, string>();
+
     // React-style loop: call LLM, run tools, repeat
     let currentMessages = inputMessages;
 
@@ -129,13 +132,21 @@ export function createAgentNode(
         const tool = toolMap.get(tc.name);
         let content: string;
 
-        if (tool) {
+        // Check cache for duplicate tool calls (same name + same args)
+        const cacheKey = `${tc.name}:${JSON.stringify(tc.args)}`;
+        const cachedResult = toolCallCache.get(cacheKey);
+
+        if (cachedResult !== undefined) {
+          content = cachedResult;
+          log.debug({ agent: name, toolName: tc.name }, "Cached tool result for %s", tc.name);
+        } else if (tool) {
           try {
             const result = await (tool as any).invoke(tc.args);
             content = typeof result === "string" ? result : JSON.stringify(result);
           } catch (err: any) {
             content = JSON.stringify({ error: err.message ?? "Tool execution failed" });
           }
+          toolCallCache.set(cacheKey, content);
         } else {
           content = JSON.stringify({ error: `Unknown tool: ${tc.name}` });
         }

@@ -9,10 +9,12 @@
 // ---- Process file loader ----
 export {
   type ProcessFile,
+  type ProcessSelectionContext,
   loadProcessFileAsync,
   loadProcessDirectory,
   getProcessesForAgent,
   buildSystemPrompt,
+  selectRelevantProcesses,
 } from "./process-loader.js";
 
 // ---- Process file watcher (hot-reload) ----
@@ -20,3 +22,6 @@ export { ProcessWatcher } from "./process-watcher.js";
 
 // ---- Ontology LangGraph tools ----
 export { createOntologyTools } from "./ontology-tools.js";
+
+// ---- Process retrieval tools ----
+export { createProcessTools } from "./process-tools.js";
