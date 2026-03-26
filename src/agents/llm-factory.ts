@@ -38,19 +38,20 @@ export function createChatModel(taskType?: TaskType): ChatOpenAI {
     return new ChatOpenAI({
       model: env.LLM_FALLBACK_MODEL ?? env.LLM_MODEL,
       apiKey: env.LLM_FALLBACK_API_KEY,
-      configuration: {
-        baseURL: env.LLM_FALLBACK_URL,
-      },
+      configuration: { baseURL: env.LLM_FALLBACK_URL },
       temperature: 0.1,
     });
   }
 
-  // Primary (local) model — default path
   return new ChatOpenAI({
     model: env.LLM_MODEL,
     apiKey: env.LLM_API_KEY,
     configuration: {
       baseURL: env.LLM_BASE_URL,
+      defaultHeaders: {
+        "HTTP-Referer": "https://valleyeats.ca",
+        "X-Title": "Sisyphus AI Dispatcher",
+      },
     },
     temperature: 0.1,
   });

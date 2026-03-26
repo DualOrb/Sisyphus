@@ -55,25 +55,25 @@ export function createOntologyTools(
     schema: z.object({
       status: z
         .string()
-        .optional()
+        .nullable().optional()
         .describe(
           "Filter by order status (e.g. Pending, Confirmed, Ready, EnRoute, InTransit, Completed, Cancelled)",
         ),
       deliveryZone: z
         .string()
-        .optional()
+        .nullable().optional()
         .describe("Filter by delivery zone / market name"),
       driverId: z
         .string()
-        .optional()
+        .nullable().optional()
         .describe("Filter by assigned driver ID (email address)"),
     }),
     func: async (input) => {
       try {
         const orders = store.queryOrders({
-          status: input.status,
-          deliveryZone: input.deliveryZone,
-          driverId: input.driverId,
+          status: input.status ?? undefined,
+          deliveryZone: input.deliveryZone ?? undefined,
+          driverId: input.driverId ?? undefined,
         });
 
         const summaries = orders.map((o) => ({
@@ -112,18 +112,18 @@ export function createOntologyTools(
     schema: z.object({
       dispatchZone: z
         .string()
-        .optional()
+        .nullable().optional()
         .describe("Filter by dispatch zone name"),
       isAvailable: z
         .boolean()
-        .optional()
+        .nullable().optional()
         .describe("Filter by availability flag (true = accepting orders)"),
     }),
     func: async (input) => {
       try {
         const drivers = store.queryDrivers({
-          dispatchZone: input.dispatchZone,
-          isAvailable: input.isAvailable,
+          dispatchZone: input.dispatchZone ?? undefined,
+          isAvailable: input.isAvailable ?? undefined,
         });
 
         const summaries = drivers.map((d) => ({
@@ -163,20 +163,20 @@ export function createOntologyTools(
     schema: z.object({
       status: z
         .string()
-        .optional()
+        .nullable().optional()
         .describe("Filter by ticket status (e.g. New, Pending, Resolved, Closed)"),
-      market: z.string().optional().describe("Filter by market / zone name"),
+      market: z.string().nullable().optional().describe("Filter by market / zone name"),
       owner: z
         .string()
-        .optional()
+        .nullable().optional()
         .describe('Filter by assigned owner (email or "Unassigned")'),
     }),
     func: async (input) => {
       try {
         const tickets = store.queryTickets({
-          status: input.status,
-          market: input.market,
-          owner: input.owner,
+          status: input.status ?? undefined,
+          market: input.market ?? undefined,
+          owner: input.owner ?? undefined,
         });
 
         const summaries = tickets.map((t) => ({
@@ -216,11 +216,11 @@ export function createOntologyTools(
     description:
       "Get full details for a specific order including linked entities: customer name, driver name, " +
       "restaurant info, and related support tickets. Use this when you need complete context about " +
-      "an order before making a decision. Takes an orderId (UUID).",
+      "an order before making a decision. Accepts either the full OrderId UUID or the 8-character OrderIdKey.",
     schema: z.object({
       orderId: z
         .string()
-        .describe("The order UUID to look up"),
+        .describe("The order ID to look up — either the full UUID (e.g. '19c2d965-0828-4d67-af20-3c193b12f23f') or the 8-char short key (e.g. '19c2d965')"),
     }),
     func: async (input) => {
       try {
@@ -346,7 +346,7 @@ export function createOntologyTools(
         ),
       hours: z
         .number()
-        .optional()
+        .nullable().optional()
         .default(2)
         .describe(
           "How many hours of history to retrieve (default: 2)",
@@ -355,7 +355,8 @@ export function createOntologyTools(
     func: async (input) => {
       try {
         const key = `timeline:${input.entityType}:${input.entityId}`;
-        const cutoff = Date.now() - input.hours * 60 * 60 * 1000;
+        const hours = input.hours ?? 24;
+        const cutoff = Date.now() - hours * 60 * 60 * 1000;
         const cutoffScore = cutoff.toString();
 
         // Retrieve timeline entries from a Redis sorted set
@@ -444,7 +445,7 @@ export function createOntologyTools(
       try {
         const executionContext: ExecutionContext = {
           redis,
-          state: buildWorldState(store),
+          state: store as unknown as Record<string, unknown>,
           correlationId: undefined,
           llmModel: "unknown",
           llmTokensUsed: 0,
@@ -504,7 +505,7 @@ export function createOntologyTools(
         ),
       urgency: z
         .enum(["normal", "high", "critical"])
-        .optional()
+        .nullable().optional()
         .default("normal")
         .describe(
           "Urgency level. 'critical' = safety issue or major customer impact, " +

@@ -60,7 +60,7 @@ export const routeDecisionTool = new DynamicStructuredTool({
         "complex_reasoning",
         "escalation_decision",
       ])
-      .optional()
+      .nullable().optional()
       .describe("Task category for model routing (optional)."),
   }),
   func: async (input) => {
@@ -150,6 +150,13 @@ You may use ontology tools (query_orders, query_drivers, query_tickets, get_orde
     const maxIterations = 5;
 
     for (let i = 0; i < maxIterations; i++) {
+      // Debug: log what we're sending to the LLM
+      log.info({
+        iteration: i,
+        messageCount: currentMessages.length,
+        messageTypes: currentMessages.map((m) => `${m.constructor.name}${(m as any).tool_calls?.length ? `(${(m as any).tool_calls.length} tool_calls)` : ""}`),
+      }, "Supervisor calling LLM");
+
       const response = await modelWithTools.invoke(currentMessages);
       newMessages.push(response);
 
@@ -181,14 +188,27 @@ You may use ontology tools (query_orders, query_drivers, query_tickets, get_orde
           "Supervisor routing decision",
         );
 
-        // Create a synthetic tool response so the message history is valid
+        // Create synthetic tool responses for ALL tool calls in this message
+        // (not just route_to_agent). Providers like Anthropic/Vertex require
+        // every tool_use to have a matching tool_result.
         const { ToolMessage } = await import("@langchain/core/messages");
-        const routeResponse = new ToolMessage({
-          content: JSON.stringify({ routed_to: nextAgent, task: currentTask }),
-          tool_call_id: routeCall.id ?? "route",
-          name: "route_to_agent",
-        });
-        newMessages.push(routeResponse);
+        for (const tc of toolCalls) {
+          if (tc.name === "route_to_agent") {
+            newMessages.push(new ToolMessage({
+              content: JSON.stringify({ routed_to: nextAgent, task: currentTask }),
+              tool_call_id: tc.id ?? "route",
+              name: "route_to_agent",
+            }));
+          } else {
+            // Provide a stub response for any non-routing tool calls
+            // that were made alongside the routing decision
+            newMessages.push(new ToolMessage({
+              content: JSON.stringify({ status: "skipped", reason: "routing decision made" }),
+              tool_call_id: tc.id ?? tc.name,
+              name: tc.name,
+            }));
+          }
+        }
         break;
       }
 
@@ -199,18 +219,38 @@ You may use ontology tools (query_orders, query_drivers, query_tickets, get_orde
       );
 
       if (nonRouteToolCalls.length > 0) {
-        const { ToolNode } = await import("@langchain/langgraph/prebuilt");
-        const toolNode = new ToolNode(allTools);
+        // Execute each tool call and create matching ToolMessages
+        const { ToolMessage } = await import("@langchain/core/messages");
+        const toolResponses: BaseMessage[] = [];
 
-        const toolResult = await toolNode.invoke({
-          messages: [...currentMessages, response],
-        });
+        for (const tc of toolCalls) {
+          const tool = allTools.find((t) => t.name === tc.name);
+          if (tool) {
+            try {
+              const result = await (tool as any).invoke(tc.args);
+              toolResponses.push(new ToolMessage({
+                content: typeof result === "string" ? result : JSON.stringify(result),
+                tool_call_id: tc.id ?? tc.name,
+                name: tc.name,
+              }));
+            } catch (err: any) {
+              toolResponses.push(new ToolMessage({
+                content: JSON.stringify({ error: err.message ?? "Tool execution failed" }),
+                tool_call_id: tc.id ?? tc.name,
+                name: tc.name,
+              }));
+            }
+          } else {
+            toolResponses.push(new ToolMessage({
+              content: JSON.stringify({ error: `Unknown tool: ${tc.name}` }),
+              tool_call_id: tc.id ?? tc.name,
+              name: tc.name,
+            }));
+          }
+        }
 
-        const toolMessages: BaseMessage[] = toolResult.messages ?? [];
-        const newToolMessages = toolMessages.slice(currentMessages.length + 1);
-        newMessages.push(...newToolMessages);
-
-        currentMessages = [...currentMessages, response, ...newToolMessages];
+        newMessages.push(...toolResponses);
+        currentMessages = [...currentMessages, response, ...toolResponses];
       }
     }
 

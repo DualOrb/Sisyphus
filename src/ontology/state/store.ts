@@ -58,8 +58,10 @@ export interface OntologyStats {
 
 export class OntologyStore {
   readonly orders = new Map<string, Order>();
+  readonly ordersByKey = new Map<string, Order>(); // OrderIdKey (8 chars) → Order
   readonly drivers = new Map<string, Driver>();
   readonly restaurants = new Map<string, Restaurant>();
+  readonly restaurantsByKey = new Map<string, Restaurant>(); // RestaurantIdKey (8 chars) → Restaurant
   readonly customers = new Map<string, Customer>();
   readonly tickets = new Map<string, Ticket>();
   readonly markets = new Map<string, Market>();
@@ -69,17 +71,20 @@ export class OntologyStore {
 
   // ---- Single-entity getters ------------------------------------------------
 
+  /** Get order by full UUID OR 8-char OrderIdKey */
   getOrder(id: string): Order | undefined {
-    return this.orders.get(id);
+    return this.orders.get(id) ?? this.ordersByKey.get(id);
   }
 
   getDriver(id: string): Driver | undefined {
     return this.drivers.get(id);
   }
 
+  /** Get restaurant by full UUID OR 8-char RestaurantIdKey */
   getRestaurant(id: string): Restaurant | undefined {
-    return this.restaurants.get(id);
+    return this.restaurants.get(id) ?? this.restaurantsByKey.get(id);
   }
+
 
   getCustomer(email: string): Customer | undefined {
     return this.customers.get(email);
@@ -136,8 +141,12 @@ export class OntologyStore {
 
   updateOrders(orders: Order[]): void {
     this.orders.clear();
+    this.ordersByKey.clear();
     for (const order of orders) {
       this.orders.set(order.orderId, order);
+      if (order.orderIdKey) {
+        this.ordersByKey.set(order.orderIdKey, order);
+      }
     }
   }
 
@@ -150,8 +159,12 @@ export class OntologyStore {
 
   updateRestaurants(restaurants: Restaurant[]): void {
     this.restaurants.clear();
+    this.restaurantsByKey.clear();
     for (const restaurant of restaurants) {
       this.restaurants.set(restaurant.restaurantId, restaurant);
+      if (restaurant.restaurantIdKey) {
+        this.restaurantsByKey.set(restaurant.restaurantIdKey, restaurant);
+      }
     }
   }
 
