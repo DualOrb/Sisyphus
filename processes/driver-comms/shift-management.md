@@ -5,104 +5,26 @@ priority: normal
 type: reference
 domain: courier-shift-management
 version: "1.0"
-source: "Dispatch Analyst Guide — How/when to drop a shift and how to send a push notification"
+source: "Dispatch Analyst Guide — How/when to drop a shift"
 ---
 
 # Courier Shift Management
 
-## Core Principle
+**Trigger:** Courier wants to drop/adjust their shift, or coverage gap detected.
 
-Couriers are independent contractors. They have complete control over their schedule and when they work. If a courier wants to drop their shift, we must oblige and not fight with them about it.
+**Check First:**
+- Couriers are independent contractors -- they have complete control over their schedule
+- Current market coverage for the affected time window
 
-## Dropping Shifts
+**Steps:**
+1. **Dropping shifts:** you may drop any time of day. You CAN ask if they mind doing an hour or two if busy. If they refuse, that is the end of it -- do not push further.
+2. **When too many shifts dropped:** (a) send driver push notification for the market (SNS for moderate, SMS for urgent). (b) Ask couriers finishing shifts to stay longer. (c) Wait 15-20 min for response. (d) Contact courier relations team.
+3. **Push notifications:** driver page > Message > select drivers/market > SNS (app only) or SMS (phone number). Urgent SMS: "URGENT! We are urgently looking for a driver to hop on in [market]. If you are available please reach out to dispatch!"
+4. **Shift start:** message all couriers to open communication. **Shift end:** thank couriers for their work.
+5. **Investigating dropped shift tickets:** read ticket details, parse shift time, check if already handled, query scheduled shifts for that window. 3+ other drivers = no gap. 0 other drivers = COVERAGE GAP, escalate and push for open shifts. Check the FUTURE time of the dropped shift, not current time.
+6. **On-call:** couriers without shifts can toggle on-call to pick up deliveries or start early/stay late.
+7. **Payout:** weekly (Sat-Fri), paid following Friday. Questions = relations@valleyeats.ca.
 
-### When a courier messages to drop their shift (day of):
-1. You may drop it **any time of day** — there is no restriction.
-2. You **can** ask them if they mind doing an hour or two of their shift if it is really busy.
-3. If they refuse, that is the end of it. There is nothing more you can do. Do not push further.
-
-### When too many shifts are dropped or you need more couriers:
-1. **First:** Send out a driver push notification for the market (see below).
-2. **Second:** Reach out to couriers finishing their shifts early to ask if they can stay on longer. (They are not obligated, but if it is busy they tend to help if asked nicely.)
-3. **Third:** If neither works, wait at least **15-20 minutes** to allow couriers to respond before contacting the courier relations team.
-4. **Last resort:** Contact the courier relations team for assistance.
-
-## Push Notifications for Coverage
-
-### How to Send a Driver Push
-
-1. Go to the driver page and select the market you need.
-2. Click on the "Message" button at the top right on the driver page.
-3. Click on which drivers you'd like to send it to (e.g., only available, only scheduled, etc.).
-4. Click on which market you want to send the push to.
-5. Choose push type:
-   - **SNS push** — Less urgent. Sends to the driver app only.
-   - **SMS push** — Urgent. Messages drivers directly via phone number.
-6. Send the message.
-
-### Push Notification Templates
-
-#### SMS (Urgent — sent to phone number)
-
-> "If anyone is available to jump on call right now, please do so and let dispatch know. Thank you!"
-
-> "URGENT! We are urgently looking for a driver to hop on in Embrun. If you are available please reach out to dispatch! Thank you"
-
-#### SNS (Less Urgent — sent to app)
-
-> "Good morning! We are urgently looking for an 11 AM driver for lunch in Perth today! Please pick up the open shift or message dispatch if you are available to drive today! Thank you!"
-
-> "We've have a few open shifts today. If you're available please pick up the shift. Thank you!"
-
-## Courier Schedule Features (Driver App)
-
-### Schedule View
-- Couriers see their schedule on a calendar view.
-- The purple "Availability" button lets them input their availability.
-- Visual indicators:
-  - **"+" sign** — an open shift is available to pick up
-  - **Green checkmark** — courier has availability marked on that day
-  - **Green car** — courier has a scheduled shift
-  - **Grayed out day** — courier marked themselves as "Unavailable"
-
-### On-Call
-- If a courier does not have a scheduled shift, they can turn on their "On-Call" button to pick up deliveries.
-- Couriers can also turn on-call on to start their shift early or drive later than their scheduled time.
-
-### Notifications
-- Notifications **must be enabled** for couriers to receive order notifications in the app.
-- Couriers must be **logged in** to receive orders.
-
-## Shift-Start and Shift-End Communication
-
-### Start of Shift
-Message your couriers to let them know you are watching their market. This also helps catch couriers who forgot about their shift — they can update you or let you know they can't make it, preventing coverage gaps later.
-
-> "Hello, I'm your dispatcher today until --:--, message me if you have any issues!"
-
-### End of Shift
-Thank couriers for their work. A courier who feels appreciated is more likely to help you in the future.
-
-> "Thank you for all your hard work today, have a great evening!"
-
-## Investigating Dropped Shift Tickets
-
-When a "Dropped Shift" ticket arrives:
-
-1. **Read the ticket details** using `get_ticket_details` to see the full description
-2. **Parse the shift time** from the description (format: [YYYY/MM/DD HH:MM:SS - HH:MM:SS])
-3. **Check if the ticket is already being handled** — if the Owner is not "Unassigned" and not you, someone else is on it. Skip.
-4. **Query scheduled shifts** using `query_driver_shifts` for that market and time window
-5. **Assess coverage**:
-   - Count how many drivers are scheduled for the dropped window
-   - If 3+ other drivers cover the same window: no coverage gap, resolve as "no_action"
-   - If 1-2 other drivers: borderline — note the risk but don't escalate yet
-   - If 0 other drivers: COVERAGE GAP — escalate immediately, push notification for open shifts
-6. **Document findings** with AddTicketNote including: which drivers are covering, any gap identified
-7. **Resolve or escalate** based on coverage assessment
-
-IMPORTANT: Check the FUTURE time of the dropped shift, not the current time. A shift dropping at 11 AM means checking 11 AM coverage, even if it's 8 AM right now.
-
-## Payout Timing Reference
-
-Couriers are paid for the current week (Saturday to Friday) on the following Friday. If a courier has payout questions, direct them to relations@valleyeats.ca.
+**Escalate If:**
+- Coverage gap with no available drivers
+- Cannot find replacement after push and 15-20 min wait
