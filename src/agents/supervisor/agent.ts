@@ -27,6 +27,7 @@ const log = createChildLogger("supervisor");
 export const AGENT_NAMES = [
   "driver_comms",
   "customer_support",
+  "task_executor",
 ] as const;
 
 export type AgentName = (typeof AGENT_NAMES)[number];
@@ -36,20 +37,14 @@ export type AgentName = (typeof AGENT_NAMES)[number];
  */
 const taskAssignmentSchema = z.object({
   agent: z
-    .enum([...AGENT_NAMES])
-    .describe("The sub-agent to delegate this task to."),
+    .string()
+    .describe("The sub-agent name. MUST be exactly one of: driver_comms, customer_support, task_executor"),
   task: z
     .string()
     .describe("Detailed description of the task, including all relevant IDs, names, and context."),
   taskType: z
-    .enum([
-      "monitoring",
-      "messaging",
-      "ticket_resolution",
-      "complex_reasoning",
-      "escalation_decision",
-    ])
-    .describe("Task category for model routing."),
+    .string()
+    .describe("Task category. One of: monitoring, messaging, ticket_resolution, complex_reasoning, escalation_decision"),
 });
 
 /**
@@ -84,13 +79,6 @@ export const assignTasksTool = new DynamicStructuredTool({
     });
   },
 });
-
-/**
- * Backward-compatible export: the old `routeDecisionTool` is replaced by
- * `assignTasksTool`, but we re-export under both names so existing barrel
- * imports don't break.
- */
-export const routeDecisionTool = assignTasksTool;
 
 // ---------------------------------------------------------------------------
 // Supervisor node factory
@@ -133,6 +121,13 @@ export function createSupervisorNode(
 
 ## Routing
 
+### ABSOLUTE RULES — NEVER VIOLATE THESE
+1. **YOU are the monitor.** You receive the full dispatch board every cycle. You watch for issues. Sub-agents only get dispatched when there is a SPECIFIC ACTION to take (send a message, assign a driver, resolve a ticket). NEVER delegate "monitor", "check on", "watch", or "confirm status" tasks — that is YOUR job. If an order is approaching ready time, YOU will see it in the next cycle's data.
+2. **NEVER message a driver whose status is En-Route, At-Restaurant, In-Bag, or InTransit.** These drivers are ACTIVELY WORKING. Do NOT create a task for them. This applies even if the order seems late.
+3. **ONE DRIVER = ONE TASK.** If a driver has multiple orders, create ONE task that mentions ALL their orders. NEVER create separate tasks for the same driver email — parallel agents WILL send duplicate messages.
+4. **customer_support handles EXISTING UNASSIGNED TICKETS ONLY.** Only assign to customer_support when the prompt lists an open ticket under "-- Open Tickets --" with status [New] or [Pending] and owner Unassigned. Include the ticket's issueId in the task description. NEVER assign customer_support to "investigate" orders, "create" tickets, or "monitor" anything.
+5. **NEVER assign empty or vague tasks.** Every task must describe a specific action. "No tasks" is not a task — use an empty array [] instead.
+
 You manage these sub-agents: ${agentMembersStr}.
 
 **YOUR ONLY JOB IS ROUTING.** You are a dispatcher, not an investigator. The prompt already contains all current orders, drivers, markets, and tickets. DO NOT call query tools to re-read data that is already in your prompt.
@@ -145,6 +140,16 @@ You can (and should) assign MULTIPLE tasks at once. If you see 3 issues, create 
 - If there are issues to address → call assign_tasks with one entry per issue
 - If everything looks stable → call assign_tasks with an empty array []
 
+### DO NOT FLAG THESE (they are NORMAL):
+- Driver going off-shift with **0 active orders** — normal end of shift
+- Orders assigned to off-shift drivers with ready times **hours in the future** — pre-scheduled evening assignments, not emergencies
+- A driver finishing their last delivery after going off-shift — normal behavior
+
+### WHEN TO MESSAGE A DRIVER:
+- Order is 5+ minutes past ready time AND driver has NOT confirmed (no DeliveryConfirmed) AND is NOT en-route/at-restaurant → message to check status
+- Driver went offline WITH active orders that are due soon (within 30 min) → message to confirm
+- DO NOT message a driver about an order that has already been reassigned away from them
+
 **DO NOT** call query_orders, query_drivers, query_tickets, or get_order_details. The data is already in your prompt. Just read it and route.
 
 The ONLY tools you should use are:
@@ -153,18 +158,35 @@ The ONLY tools you should use are:
 - "request_clarification" — ONLY for situations you genuinely cannot handle
 
 ### Agent Responsibilities:
-- **driver_comms** — Message drivers, check on offline/late drivers, assignment issues, driver coverage gaps, restaurant pausing when it affects active deliveries
-- **customer_support** — Support tickets, refunds, customer communication, restaurant issues reported via tickets, menu/admin issues discovered during ticket investigation
+- **driver_comms** — ACTIONS only: send a message to a driver, follow up on an unanswered message, reassign an order, assign an unassigned order to a driver. Only dispatch when you have a specific action to take — never to "check on" or "monitor" a driver
+- **customer_support** — Resolve EXISTING UNASSIGNED TICKETS only. Assign ONLY when the prompt shows an open ticket (issueId listed under "-- Open Tickets --"). Include the issueId in your task. Never assign for order investigation, late delivery monitoring, or ticket creation
+- **task_executor** — General-purpose action execution: order status updates, order cancellations, ticket notes/escalations, flagging market issues, and restaurant lookups (query_restaurants). NOTE: restaurant admin actions (pause/unpause, menu toggles, hours adjustments, delivery zone updates) are NOT yet registered — do NOT assign those tasks to task_executor as they will fail with "Unknown action". For restaurant operational issues that need manual intervention, escalate to a human operator instead
 
 ### TASK DESCRIPTION REQUIREMENTS
 When routing, you MUST include ALL of the following in your task description:
 - **Driver email addresses** (e.g. "Driver SJS (sukhkalsi65561@gmail.com)") — agents use email as driverId, NOT monikers
-- **Order IDs** (short form e.g. "dfee7605")
+- **Order IDs** — use the 8-char OrderIdKey (e.g. "dfee7605"). Copy them from the dispatch data above. The dispatch data lists order IDs next to each driver — USE THEM
 - **Current status** and **ready time**
 - **Restaurant name** and **delivery address**
-- **What action you think is needed** — be specific ("send a check-in message", "investigate and resolve ticket")
+- **What action you think is needed** — be specific ("send a check-in message", "investigate and resolve ticket 7645aca1")
 
-If you do NOT have a driver's email address in the prompt, tell the sub-agent to call query_drivers to look it up FIRST before attempting any action. Example: "Driver DIK in PortElgin — email not available in prompt, use query_drivers({dispatchZone: 'PortElgin'}) to find their email before assigning."
+If you do NOT have a driver's email address in the prompt, tell the sub-agent to call query_drivers to look it up FIRST before attempting any action.
+
+### CRITICAL: NEVER FABRICATE IDs
+Every order ID, ticket ID, and driver email you pass to a sub-agent MUST be copied verbatim from the dispatch data above. If you write "1 active order" without the OrderIdKey, the sub-agent WILL fail. If you cannot find the specific ID, tell the sub-agent to query for it.
+
+### MARKET HEALTH IS YOUR JOB
+You already receive the full dispatch board, driver counts, order counts, and focus areas every cycle. Do NOT delegate "check market health" or "monitor staffing" to any sub-agent. If you see a market issue (low drivers, high ETAs, surge), either:
+- Flag it yourself via execute_action(FlagMarketIssue) if it needs recording
+- Include it in your cycle summary for the next cycle
+- Escalate to a human if it needs manual intervention
+
+### RECENT ACTIONS — CHECK BEFORE DISPATCHING
+The prompt includes a RECENT ACTIONS section showing everything the AI has done recently.
+- Before assigning driver_comms: check if the driver was already messaged about the same issue. If messaged <5 min ago, do NOT re-message — wait for the follow-up timer.
+- If an entity shows 3+ failed attempts for the same action, consider escalating instead of retrying.
+- Check PENDING FOLLOW-UPS — if a follow-up is due or overdue, dispatch driver_comms for that specific follow-up.
+- If the RECENT ACTIONS section is empty, this is a fresh start — act normally.
 `;
 
   return async (state: AgentStateType): Promise<AgentStateUpdate> => {
@@ -279,9 +301,63 @@ If you do NOT have a driver's email address in the prompt, tell the sub-agent to
 
       if (assignCall) {
         const args = assignCall.args as { tasks: TaskAssignment[] };
-        pendingTasks = (args.tasks ?? []).filter((t) =>
+        const validTasks = (args.tasks ?? []).filter((t) =>
           (AGENT_NAMES as readonly string[]).includes(t.agent),
         );
+        // Deduplicate — LLMs sometimes emit the same task twice
+        const seen = new Set<string>();
+        const deduped = validTasks.filter((t) => {
+          const key = `${t.agent}:${t.task.slice(0, 200)}`;
+          if (seen.has(key)) {
+            log.info({ agent: t.agent, task: t.task.slice(0, 60) }, "Deduped duplicate task");
+            return false;
+          }
+          seen.add(key);
+          return true;
+        });
+
+        // ----------------------------------------------------------------
+        // Code-level enforcement of routing rules the LLM ignores
+        // ----------------------------------------------------------------
+        pendingTasks = deduped.filter((t) => {
+          const taskLower = t.task.toLowerCase();
+
+          // RULE: customer_support ONLY handles existing tickets with a real issueId
+          if (t.agent === "customer_support") {
+            // Task must reference a ticket ID (8-char hex) in a ticket context
+            const hasTicketRef = /\b[a-f0-9]{8}\b/.test(t.task) &&
+              (taskLower.includes("ticket") || taskLower.includes("issueid") || taskLower.includes("issue id"));
+            if (!hasTicketRef) {
+              log.info({ agent: t.agent, task: t.task.slice(0, 80) }, "Dropped: customer_support assigned without ticket reference");
+              return false;
+            }
+          }
+
+          // RULE: No monitoring/check-on tasks for ANY agent
+          {
+            const isMonitoring = taskLower.includes("monitor ") || taskLower.includes("monitoring") ||
+              taskLower.startsWith("check on ") || taskLower.startsWith("check the status") ||
+              taskLower.includes("confirm status") || taskLower.includes("watch for") ||
+              taskLower.includes("market health");
+            // Allow if the task also contains a concrete action verb
+            const hasAction = taskLower.includes("send ") || taskLower.includes("message ") ||
+              taskLower.includes("assign ") || taskLower.includes("reassign") ||
+              taskLower.includes("resolve ") || taskLower.includes("follow up") ||
+              taskLower.includes("escalat");
+            if (isMonitoring && !hasAction) {
+              log.info({ agent: t.agent, task: t.task.slice(0, 80) }, "Dropped: monitoring task (supervisor's job)");
+              return false;
+            }
+          }
+
+          // RULE: No empty or "no tasks" assignments
+          if (t.task.trim().length < 10 || taskLower === "no tasks") {
+            log.info({ agent: t.agent, task: t.task.slice(0, 80) }, "Dropped: empty/vague task");
+            return false;
+          }
+
+          return true;
+        });
         decided = true;
 
         log.info(
