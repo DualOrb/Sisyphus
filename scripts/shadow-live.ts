@@ -18,7 +18,7 @@ import { mkdirSync, appendFileSync, writeFileSync } from "node:fs";
 import { resolve } from "node:path";
 import { randomUUID } from "node:crypto";
 import { S3Client, GetObjectCommand } from "@aws-sdk/client-s3";
-import { DynamoDBClient, QueryCommand } from "@aws-sdk/client-dynamodb";
+import { DynamoDBClient, QueryCommand, ScanCommand } from "@aws-sdk/client-dynamodb";
 import { unmarshall } from "@aws-sdk/util-dynamodb";
 
 import { OntologyStore } from "../src/ontology/state/store.js";
@@ -140,6 +140,32 @@ async function fetchRelevantTickets(): Promise<any[]> {
     }
   }
   return tickets;
+}
+
+async function fetchDriverConversations(): Promise<any[]> {
+  const conversations: any[] = [];
+  let lastKey: any = undefined;
+  try {
+    do {
+      const result = await dynamo.send(
+        new ScanCommand({
+          TableName: "ValleyEats-DriverLatestMessage",
+          ExclusiveStartKey: lastKey,
+        }),
+      );
+      if (result.Items) {
+        for (const item of result.Items) {
+          try {
+            conversations.push(unmarshall(item));
+          } catch { /* skip */ }
+        }
+      }
+      lastKey = result.LastEvaluatedKey;
+    } while (lastKey);
+  } catch (err: any) {
+    log.warn({ err: err.message }, "DriverLatestMessage scan failed");
+  }
+  return conversations;
 }
 
 // ---------------------------------------------------------------------------
@@ -403,18 +429,30 @@ async function main() {
     try {
       const data = await fetchDispatchFile();
       latestDispatchData = data;
+
+      // Don't mutate the store while the graph is executing —
+      // agents need a stable view of orders/drivers during their run.
+      // Still fetch dispatch.txt above so latestDispatchData is current
+      // for change detection on the next cycle.
+      if (graphRunning) return;
+
       syncer.syncFromDispatchFile(data);
 
       // Broadcast sync to dashboard
       sseManager.broadcast("sync", store.getStats());
 
-      // Tickets every 3rd sync
+      // Tickets + conversations every 3rd sync
       if (syncCount === 1 || syncCount % 3 === 0) {
         try {
-          const tickets = await fetchRelevantTickets();
+          const [tickets, conversations] = await Promise.all([
+            fetchRelevantTickets(),
+            fetchDriverConversations(),
+          ]);
           syncer.syncTickets(tickets);
-          if (tickets.length > 0 && syncCount === 1) {
-            logBoth(`  [${now()}] ${tickets.length} tickets synced`);
+          syncer.syncConversations(conversations);
+          if (syncCount === 1) {
+            if (tickets.length > 0) logBoth(`  [${now()}] ${tickets.length} tickets synced`);
+            logBoth(`  [${now()}] ${conversations.length} driver conversations synced`);
           }
         } catch { /* non-fatal */ }
       }
