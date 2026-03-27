@@ -28,6 +28,15 @@ import { EventDetector } from "./detector.js";
 import { EventDispatcher } from "./dispatcher.js";
 import type { EventQueue } from "./queue.js";
 import { createChildLogger } from "../lib/logger.js";
+import {
+  ActionLedger,
+  mapActionToKind,
+  guessEntityTypeFromAction,
+  extractEntityId,
+  buildEntrySummary,
+  needsFollowUp,
+  FOLLOW_UP_INTERVAL_MS,
+} from "./action-ledger.js";
 
 const log = createChildLogger("events:cycle");
 
@@ -153,6 +162,13 @@ export class DispatchCycle {
   private readonly dispatchedIssues = new Map<string, number>();
   private static readonly DEDUP_TTL_MS = 300_000; // 5 minutes
 
+  /**
+   * Rolling action ledger — accumulates everything the AI system has done
+   * across cycles. Rendered into the supervisor prompt so it can reason
+   * about what's already happened and what follow-ups are pending.
+   */
+  private readonly ledger: ActionLedger;
+
   constructor(config: DispatchCycleConfig) {
     this.store = config.store;
     this.graph = config.graph;
@@ -166,6 +182,7 @@ export class DispatchCycle {
     this.shiftHandoff = config.shiftHandoff ?? null;
     this.shiftId = config.shiftId ?? "unknown";
     this.operatingMode = config.operatingMode ?? "shadow";
+    this.ledger = new ActionLedger();
   }
 
   // =========================================================================
@@ -314,19 +331,37 @@ export class DispatchCycle {
       combinedPrompt += `PREVIOUS CYCLE SUMMARY: ${this.cycleSummary}\n\n`;
     }
 
+    // Append rolling action ledger — everything the AI has done recently
+    if (!this.isFirstCycle) {
+      const ledgerSection = this.ledger.renderForPrompt();
+      if (ledgerSection) {
+        combinedPrompt += ledgerSection + "\n";
+      }
+    }
+
     // Build situation prompt from dispatch.txt changes
     if (dispatchData) {
       combinedPrompt += buildChangesPrompt(changes, dispatchData, this.isFirstCycle);
 
-      // Append open ticket summary
+      // Append open ticket summary — annotate tickets already dispatched
       const ticketCount = this.store.tickets.size;
       if (ticketCount > 0) {
         const ticketLines: string[] = [`\n-- Open Tickets (${ticketCount}) --`];
         for (const t of this.store.tickets.values()) {
           const age = Math.round((Date.now() - t.createdAt.getTime()) / 60000);
+          const alreadyHandled = this.dispatchedIssues.has(`ticket:${t.issueId}`);
+          const annotation = alreadyHandled
+            ? " [ALREADY DISPATCHED — do NOT re-dispatch unless status changed]"
+            : "";
+          const ownerLabel = t.owner === "Unassigned" ? "UNASSIGNED" : `owner: ${t.owner}`;
+          const orderRef = t.orderIdKey ? ` | order: ${t.orderIdKey}` : "";
           ticketLines.push(
-            `  ${t.issueId}: [${t.status}] ${t.category} / ${t.issueType} -- ${t.restaurantName ?? t.originator} (${age}m old)`,
+            `  ticket ${t.issueId}: [${t.status}] [${ownerLabel}] ${t.category} / ${t.issueType} -- ${t.restaurantName ?? t.originator}${orderRef} (${age}m old)${annotation}`,
           );
+          // Mark as dispatched so next cycle annotates it
+          if (!alreadyHandled) {
+            this.dispatchedIssues.set(`ticket:${t.issueId}`, Date.now());
+          }
         }
         combinedPrompt += "\n" + ticketLines.join("\n") + "\n";
       }
@@ -408,6 +443,69 @@ export class DispatchCycle {
       const messages = (result as any)?.messages ?? [];
       summary = extractCycleSummary(messages);
       this.cycleSummary = summary ?? "";
+
+      // Record actions into the rolling ledger.
+      // We need to correlate AIMessage tool_calls (which have the action name/params)
+      // with ToolMessage results (which have the outcome). Build a map of
+      // tool_call_id → args from AIMessages, then match with ToolMessage results.
+      this.ledger.prune();
+      const nowMs = Date.now();
+
+      // Step 1: Index all execute_action tool call args by their call ID
+      const toolCallArgs = new Map<string, { actionName: string; params: Record<string, any>; reasoning: string }>();
+      for (const msg of messages) {
+        if (msg.constructor?.name !== "AIMessage") continue;
+        const aiMsg = msg as AIMessage;
+        const calls = aiMsg.tool_calls ?? [];
+        for (const tc of calls) {
+          if (tc.name === "execute_action" && tc.id) {
+            toolCallArgs.set(tc.id, {
+              actionName: (tc.args as any)?.actionName ?? "unknown",
+              params: (tc.args as any)?.params ?? {},
+              reasoning: (tc.args as any)?.reasoning ?? "",
+            });
+          }
+        }
+      }
+
+      // Step 2: Walk ToolMessages and correlate with the call args
+      for (const msg of messages) {
+        if (msg.constructor?.name !== "ToolMessage") continue;
+        const content = typeof (msg as any).content === "string" ? (msg as any).content : "";
+        const toolName = (msg as any).name;
+        const toolCallId = (msg as any).tool_call_id;
+
+        if (toolName !== "execute_action") continue;
+
+        try {
+          const result = JSON.parse(content);
+          const outcome = result.outcome ?? (result.skipped ? "skipped" : "unknown");
+
+          // Get the original call args for full context
+          const callArgs = toolCallId ? toolCallArgs.get(toolCallId) : undefined;
+          const actionType = callArgs?.actionName ?? result.actionType ?? "unknown";
+          const params = callArgs?.params ?? result.params ?? {};
+          const reasoning = callArgs?.reasoning ?? result.reasoning ?? "";
+
+          // Build a merged object for the summary builder
+          const merged = { actionType, outcome, params, reasoning, ...result };
+          const entityId = extractEntityId(merged);
+
+          this.ledger.record({
+            ts: nowMs,
+            kind: mapActionToKind(actionType, outcome),
+            action: actionType,
+            entityId,
+            entityType: guessEntityTypeFromAction(actionType),
+            summary: buildEntrySummary(merged),
+            outcome,
+            followUpAt: needsFollowUp(actionType, outcome) ? nowMs + FOLLOW_UP_INTERVAL_MS : undefined,
+            cycleNumber: this.cycleCount,
+          });
+        } catch {
+          // Not JSON or unparseable — skip
+        }
+      }
     } catch (err) {
       this.lastLlmCall = Date.now();
       this.isFirstCycle = false;
@@ -554,6 +652,7 @@ function detectChanges(
 
     // New and changed orders
     for (const o of curOrders) {
+      if ((o.OrderType ?? "Delivery") === "Takeout") continue;
       const prev = prevOrderMap.get(o.OrderId);
       if (!prev) {
         const driver = curDrivers.find((d: any) => d.DriverId === o.DriverId);
@@ -608,7 +707,19 @@ function detectChanges(
         if (!prev.OnShift && d.OnShift) {
           details.push({ type: "driver_online", zone, description: `Driver ${name} came on-shift in ${zone}` });
         } else if (prev.OnShift && !d.OnShift) {
-          details.push({ type: "driver_offline", zone, description: `Driver ${name} went off-shift in ${zone}` });
+          // Only flag if driver has orders that are NOT InTransit/InBag
+          // (InTransit = driver is finishing their last delivery, which is normal end-of-shift)
+          const driverOrders = curOrders.filter((o: any) => o.DriverId === d.DriverId);
+          const needsAttention = driverOrders.filter((o: any) => {
+            const status = deriveOrderStatus(o);
+            const activeDelivery = ["intransit", "inbag", "at-customer", "atcustomer"]
+              .includes(status.currentStatus.toLowerCase().replace(/[-_ ]/g, ""));
+            return !activeDelivery;
+          });
+          if (needsAttention.length > 0) {
+            details.push({ type: "driver_offline", zone, description: `Driver ${name} (${d.DriverId}) went off-shift in ${zone} WITH ${needsAttention.length} order(s) not yet picked up` });
+          }
+          // Otherwise: driver finishing InTransit deliveries after shift = normal
         }
         if (!prev.Paused && d.Paused) {
           details.push({ type: "driver_paused", zone, description: `Driver ${name} was paused in ${zone}` });
@@ -618,15 +729,25 @@ function detectChanges(
       }
     }
 
-    // Drivers that left dispatch
+    // Drivers that left dispatch — only flag if they had orders not yet picked up
     for (const d of prevDrivers) {
       if (!curDriverMap.has(d.DriverId)) {
-        const name = d.Monacher || d.FullName || d.DriverId.split("@")[0];
-        details.push({
-          type: "driver_disappeared",
-          zone,
-          description: `Driver ${name} left dispatch in ${zone}`,
+        const driverOrders = curOrders.filter((o: any) => o.DriverId === d.DriverId);
+        const needsAttention = driverOrders.filter((o: any) => {
+          const status = deriveOrderStatus(o);
+          const activeDelivery = ["intransit", "inbag", "at-customer", "atcustomer"]
+            .includes(status.currentStatus.toLowerCase().replace(/[-_ ]/g, ""));
+          return !activeDelivery;
         });
+        if (needsAttention.length > 0) {
+          const name = d.Monacher || d.FullName || d.DriverId.split("@")[0];
+          details.push({
+            type: "driver_disappeared",
+            zone,
+            description: `Driver ${name} (${d.DriverId}) left dispatch in ${zone} WITH ${needsAttention.length} order(s) not yet picked up`,
+          });
+        }
+        // Otherwise: driver leaving dispatch with 0 orders is normal, no event needed
       }
     }
   }
@@ -686,10 +807,11 @@ function deriveOrderStatus(o: any): OrderStatusInfo {
     (s) => currentStatus.toLowerCase().replace(/[-_ ]/g, "") === s.toLowerCase().replace(/[-_ ]/g, ""),
   );
 
-  // Only flag as LATE if past ready time AND driver is NOT actively working on it
+  // Only flag as LATE if 5+ minutes past ready time AND driver is NOT actively working on it
+  const LATE_THRESHOLD_MS = 5 * 60 * 1000; // 5 minutes
   const isLate = !!(
     readyTime &&
-    readyTime.getTime() < Date.now() &&
+    (Date.now() - readyTime.getTime()) > LATE_THRESHOLD_MS &&
     !isDriverActive &&
     currentStatus !== "InTransit" &&
     currentStatus !== "Completed" &&
@@ -699,6 +821,26 @@ function deriveOrderStatus(o: any): OrderStatusInfo {
   const driverConfirmed = !!(o.DeliveryConfirmed || o.DeliveryConfirmedTime);
 
   return { currentStatus, timeline, isLate, driverConfirmed };
+}
+
+/** Minimum time after confirmation before showing unassigned orders to the AI. */
+const CONFIRMED_GRACE_PERIOD_MS = 2 * 60 * 1000; // 2 minutes
+
+/**
+ * Returns true if the order was confirmed by the restaurant less than 2 minutes
+ * ago. These orders are expected to be assigned a driver by the router shortly
+ * and don't need AI attention yet.
+ */
+function isRecentlyConfirmed(o: any): boolean {
+  // Use the confirmed timestamp — try OrderConfirmedNotifiedTime first (when
+  // the restaurant tapped confirm), then DeliveryConfirmedTime, then fall back
+  // to OrderPlacedTime as a conservative proxy.
+  const confirmedEpoch =
+    o.OrderConfirmedNotifiedTime ?? o.DeliveryConfirmedTime ?? o.OrderPlacedTime;
+  if (!confirmedEpoch) return false;
+
+  const confirmedAt = new Date(confirmedEpoch * 1000);
+  return Date.now() - confirmedAt.getTime() < CONFIRMED_GRACE_PERIOD_MS;
 }
 
 // ---------------------------------------------------------------------------
@@ -717,7 +859,14 @@ function buildChangesPrompt(
     lines.push(
       `SISYPHUS DISPATCH -- ${new Date().toLocaleString("en-US", { timeZone: TZ })}`,
     );
-    lines.push(`This is the initial state. Review the full board and identify any issues.`);
+    lines.push(`This is the initial state board — a BASELINE, not a list of problems.`);
+    lines.push(`Most drivers and orders are operating normally. ONLY flag items that actually need intervention:`);
+    lines.push(`- Orders that are LATE (5+ minutes past ready time with no driver progress)`);
+    lines.push(`- Orders that are UNASSIGNED and need a driver`);
+    lines.push(`- Drivers that are OFFLINE with active non-delivered orders`);
+    lines.push(`- Open tickets that need resolution`);
+    lines.push(`Do NOT message drivers who are actively working (En-Route, At-Restaurant, In-Bag, InTransit).`);
+    lines.push(`Do NOT "check on" every driver — only those with actual problems.`);
     lines.push(``);
 
     for (const zone of zones) {
@@ -730,29 +879,76 @@ function buildChangesPrompt(
       lines.push(`-- ${zone} (${onShift.length} drivers on-shift, ${orders.length} orders) --`);
 
       for (const d of drivers) {
+        // Skip off-shift drivers with nothing actionable
+        if (!d.OnShift && !d.Available) {
+          const driverOrders = orders.filter((o: any) => o.DriverId === d.DriverId);
+          const allHandled = driverOrders.every((o: any) => {
+            // Pre-scheduled: ready 60+ min out
+            const ready = o.OrderReadyTime ? new Date(o.OrderReadyTime * 1000) : null;
+            if (ready && (ready.getTime() - Date.now()) / 60000 > 30) return true;
+            // Actively delivering: InTransit, InBag, At-Customer = finishing last delivery
+            const status = deriveOrderStatus(o);
+            const delivering = ["intransit", "inbag", "at-customer", "atcustomer"]
+              .includes(status.currentStatus.toLowerCase().replace(/[-_ ]/g, ""));
+            return delivering;
+          });
+          if (driverOrders.length === 0 || allHandled) continue;
+        }
+
         const status = d.Paused ? "PAUSED" : d.OnShift ? "ON-SHIFT" : d.Available ? "ON-CALL" : "OFF";
-        const orderCount = orders.filter((o: any) => o.DriverId === d.DriverId).length;
+        // Only count non-pre-scheduled orders
+        const visibleOrders = orders.filter((o: any) => {
+          if (o.DriverId !== d.DriverId) return false;
+          const ready = o.OrderReadyTime ? new Date(o.OrderReadyTime * 1000) : null;
+          const minsOut = ready ? (ready.getTime() - Date.now()) / 60000 : 0;
+          return !(minsOut > 30 && !d.OnShift);
+        });
         const name = d.Monacher || d.FullName?.split(" ")[0] || d.DriverId.split("@")[0];
         const flags = [
           d.TrainingOrders > 0 ? `trainee(${d.TrainingOrders})` : "",
           d.Alcohol ? "smartserve" : "",
           d.NearEnd ? "NEAR-END" : "",
         ].filter(Boolean).join(", ");
-        lines.push(`  ${name} (${d.DriverId}): ${status}, ${orderCount} orders${flags ? ` [${flags}]` : ""}`);
+        const orderIds = visibleOrders.map((o: any) => o.OrderIdKey).filter(Boolean);
+        const orderIdsSuffix = orderIds.length > 0 ? ` [${orderIds.join(", ")}]` : "";
+        lines.push(`  ${name} (${d.DriverId}): ${status}, ${visibleOrders.length} orders${orderIdsSuffix}${flags ? ` [${flags}]` : ""}`);
       }
 
-      for (const o of orders) {
+      // Filter out Takeout orders — not relevant to dispatch (no driver needed)
+      const deliveryOrders = orders.filter((o: any) =>
+        (o.OrderType ?? "Delivery") !== "Takeout"
+      );
+
+      // Only show orders that need attention — LATE, UNASSIGNED, or problematic.
+      // Orders progressing normally (assigned driver, not late) are noise.
+      for (const o of deliveryOrders) {
         const readyTime = o.OrderReadyTime ? new Date(o.OrderReadyTime * 1000) : null;
         const driver = drivers.find((d: any) => d.DriverId === o.DriverId);
+
+        // Skip pre-scheduled orders entirely — ready 60+ min out with offline driver
+        const minsUntilReady = readyTime ? (readyTime.getTime() - Date.now()) / 60000 : 0;
+        const driverIsOffline = driver && !driver.OnShift;
+        if (minsUntilReady > 30 && driverIsOffline) continue;
+
+        const status = deriveOrderStatus(o);
+        const isUnassigned = !o.DriverId;
+        const hasOfflineDriver = driver && !driver.OnShift && !driverIsOffline;
+
+        // Skip recently confirmed unassigned orders — the router will assign
+        // a driver shortly. Only surface after 2 minutes without assignment.
+        if (isUnassigned && isRecentlyConfirmed(o)) continue;
+
+        // Skip orders that are on track — has a driver, not late, progressing normally
+        if (!status.isLate && !isUnassigned && !hasOfflineDriver) continue;
+
         const driverMonacher = driver?.Monacher || driver?.FullName?.split(" ")[0] || null;
         const driverEmail = o.DriverId || null;
         const driverLabel = driverMonacher && driverEmail
           ? `${driverMonacher} (${driverEmail})`
           : driverMonacher || driverEmail || "UNASSIGNED";
-        const status = deriveOrderStatus(o);
         const alcohol = o.Alcohol ? " [ALCOHOL]" : "";
         lines.push(
-          `  Order ${o.OrderIdKey}: ${status.currentStatus}${status.isLate ? " LATE" : ""}${alcohol} | ${o.RestaurantName} -> ${o.DeliveryStreet || "?"}, ${o.DeliveryCity || ""} | Driver: ${driverLabel} | Ready: ${formatTime(readyTime)} (${minutesAgo(readyTime)})${status.timeline ? ` | ${status.timeline}` : ""}`,
+          `  Order ${o.OrderIdKey}: ${status.currentStatus}${status.isLate ? " LATE" : ""}${isUnassigned ? " UNASSIGNED" : ""}${alcohol} | ${o.RestaurantName} -> ${o.DeliveryStreet || "?"}, ${o.DeliveryCity || ""} | Driver: ${driverLabel} | Ready: ${formatTime(readyTime)} (${minutesAgo(readyTime)})${status.timeline ? ` | ${status.timeline}` : ""}`,
         );
       }
       lines.push(``);
@@ -781,6 +977,27 @@ function buildChangesPrompt(
     }
     lines.push(``);
 
+    // Compact summary of ALL markets so supervisor has full picture
+    // (detailed breakdown follows only for affected zones)
+    const marketSummary: string[] = ["-- All Markets Overview --"];
+    for (const zone of zones) {
+      const zd = dispatchData[zone];
+      const zOrders = (zd.Orders ?? []).filter((o: any) => (o.OrderType ?? "Delivery") !== "Takeout");
+      const zDrivers = (zd.Drivers ?? []).filter((d: any) => d.OnShift && !d.Paused);
+      if (zOrders.length === 0 && zDrivers.length === 0) continue;
+      const lateCount = zOrders.filter((o: any) => {
+        const ready = o.OrderReadyTime ? new Date(o.OrderReadyTime * 1000) : null;
+        return ready && (Date.now() - ready.getTime()) > 5 * 60 * 1000;
+      }).length;
+      const unassigned = zOrders.filter((o: any) => !o.DriverId).length;
+      const flags: string[] = [];
+      if (lateCount > 0) flags.push(`${lateCount} late`);
+      if (unassigned > 0) flags.push(`${unassigned} unassigned`);
+      marketSummary.push(`  ${zone}: ${zDrivers.length} drivers, ${zOrders.length} orders${flags.length > 0 ? ` [${flags.join(", ")}]` : ""}`);
+    }
+    lines.push(marketSummary.join("\n"));
+    lines.push(`(Detailed breakdown below for zones with changes only)\n`);
+
     const affectedZones = new Set(changes.details.map((d) => d.zone).filter(Boolean));
     for (const zone of affectedZones) {
       const zd = dispatchData[zone!];
@@ -792,22 +1009,45 @@ function buildChangesPrompt(
       lines.push(`Current state of ${zone} (${onShift.length} on-shift, ${orders.length} orders):`);
       for (const d of drivers) {
         const status = d.Paused ? "PAUSED" : d.OnShift ? "ON-SHIFT" : "OFF";
-        const orderCount = orders.filter((o: any) => o.DriverId === d.DriverId).length;
+        const driverOrders = orders.filter((o: any) => o.DriverId === d.DriverId);
         const name = d.Monacher || d.FullName?.split(" ")[0] || d.DriverId.split("@")[0];
-        lines.push(`  ${name} (${d.DriverId}): ${status}, ${orderCount} orders`);
+        const orderIds = driverOrders.map((o: any) => o.OrderIdKey).filter(Boolean);
+        const orderIdsSuffix = orderIds.length > 0 ? ` [${orderIds.join(", ")}]` : "";
+        lines.push(`  ${name} (${d.DriverId}): ${status}, ${driverOrders.length} orders${orderIdsSuffix}`);
       }
-      for (const o of orders) {
+      // Filter out Takeout orders — not relevant to dispatch (no driver needed)
+      const deliveryOrders = orders.filter((o: any) =>
+        (o.OrderType ?? "Delivery") !== "Takeout"
+      );
+
+      // Only show orders that need attention in affected zones
+      for (const o of deliveryOrders) {
         const readyTime = o.OrderReadyTime ? new Date(o.OrderReadyTime * 1000) : null;
         const driver = drivers.find((d: any) => d.DriverId === o.DriverId);
+
+        const minsUntilReady = readyTime ? (readyTime.getTime() - Date.now()) / 60000 : 0;
+        const driverIsOffline = driver && !driver.OnShift;
+        if (minsUntilReady > 30 && driverIsOffline) continue;
+
+        const status = deriveOrderStatus(o);
+        const isUnassigned = !o.DriverId;
+        const hasOfflineDriver = driver && !driver.OnShift && !driverIsOffline;
+
+        // Skip recently confirmed unassigned orders — the router will assign
+        // a driver shortly. Only surface after 2 minutes without assignment.
+        if (isUnassigned && isRecentlyConfirmed(o)) continue;
+
+        // Skip orders that are on track — has a driver, not late, progressing normally
+        if (!status.isLate && !isUnassigned && !hasOfflineDriver) continue;
+
         const driverMonacher = driver?.Monacher || driver?.FullName?.split(" ")[0] || null;
         const driverEmail = o.DriverId || null;
         const driverLabel = driverMonacher && driverEmail
           ? `${driverMonacher} (${driverEmail})`
           : driverMonacher || driverEmail || "UNASSIGNED";
-        const status = deriveOrderStatus(o);
         const alcohol = o.Alcohol ? " [ALCOHOL]" : "";
         lines.push(
-          `  Order ${o.OrderIdKey}: ${status.currentStatus}${status.isLate ? " LATE" : ""}${alcohol} | ${o.RestaurantName} | Driver: ${driverLabel} | Ready: ${formatTime(readyTime)} (${minutesAgo(readyTime)})${status.timeline ? ` | ${status.timeline}` : ""}`,
+          `  Order ${o.OrderIdKey}: ${status.currentStatus}${status.isLate ? " LATE" : ""}${isUnassigned ? " UNASSIGNED" : ""}${alcohol} | ${o.RestaurantName} | Driver: ${driverLabel} | Ready: ${formatTime(readyTime)} (${minutesAgo(readyTime)})${status.timeline ? ` | ${status.timeline}` : ""}`,
         );
       }
       lines.push(``);
