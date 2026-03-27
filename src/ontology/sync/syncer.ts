@@ -342,11 +342,31 @@ export class OntologySyncer {
       const orders: ReturnType<typeof transformOrder>[] = [];
       const drivers: ReturnType<typeof transformDriver>[] = [];
       const markets: ReturnType<typeof transformMarket>[] = [];
+      const conversations: ReturnType<typeof transformConversation>[] = [];
+
+      // First pass: collect per-zone ETA from Alerts
+      // Alerts have { Eta: "10", Title: "PortPerryEta", ... }
+      // Title format is "<MarketName>Eta" — extract ETA per zone
+      const zoneEtas = new Map<string, number>();
+      for (const zone of zones) {
+        const alerts = data[zone]?.Alerts;
+        if (Array.isArray(alerts)) {
+          for (const alert of alerts) {
+            if (alert?.Title && alert?.Eta != null) {
+              // Title = "PortPerryEta" → market = "PortPerry"
+              const marketName = alert.Title.replace(/Eta$/i, "");
+              if (marketName) {
+                zoneEtas.set(marketName, parseInt(alert.Eta, 10) || 0);
+              }
+            }
+          }
+        }
+      }
 
       for (const zone of zones) {
         const zoneData = data[zone];
 
-        // Drivers
+        // Drivers + their conversations (from Messages array)
         if (zoneData?.Drivers) {
           for (const d of zoneData.Drivers) {
             try {
@@ -358,6 +378,31 @@ export class OntologySyncer {
                   Active: d.Active ?? true,
                 }),
               );
+
+              // Extract conversation from driver's Messages array
+              // dispatch.txt Messages: [{ message, messageId, sent }, ...]
+              if (Array.isArray(d.Messages) && d.Messages.length > 0) {
+                // Sort by sent timestamp descending to find latest
+                const sorted = [...d.Messages].sort(
+                  (a: any, b: any) => (b.sent ?? 0) - (a.sent ?? 0),
+                );
+                const latest = sorted[0];
+                try {
+                  conversations.push(
+                    transformConversation({
+                      DriverId: d.DriverId,
+                      Message: latest.message ?? "",
+                      Author: d.FullName ?? "Driver",
+                      // dispatch.txt doesn't include Colour — assume from driver
+                      Colour: "Undefined",
+                      ts: latest.sent,
+                      // No Opened timestamp available in dispatch.txt
+                    }),
+                  );
+                } catch {
+                  /* skip */
+                }
+              }
             } catch {
               /* skip bad records */
             }
@@ -381,13 +426,15 @@ export class OntologySyncer {
           }
         }
 
-        // Markets (from Meter)
+        // Markets (from Meter + ETA from Alerts)
         if (zoneData?.Meter) {
           try {
+            const eta = zoneEtas.get(zone);
             markets.push(
               transformMarket({
                 Market: zone,
                 ...zoneData.Meter,
+                ...(eta != null ? { Eta: eta } : {}),
               }),
             );
           } catch {
@@ -400,6 +447,9 @@ export class OntologySyncer {
       this.store.updateOrders(orders);
       this.store.updateDrivers(drivers);
       this.store.updateMarkets(markets);
+      if (conversations.length > 0) {
+        this.store.updateConversations(conversations);
+      }
 
       // Enrich cross-entity computed fields
       this.enrichDriverOrderCounts();
@@ -419,6 +469,7 @@ export class OntologySyncer {
           orders: stats.orders,
           drivers: stats.drivers,
           markets: stats.markets,
+          conversations: stats.conversations,
           source: "dispatch.txt",
         },
         `Dispatch file sync completed in ${durationMs}ms`,
