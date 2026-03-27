@@ -86,6 +86,8 @@ every 30 seconds:
 
 ### 2.2 Market Monitor Agent
 
+> **DEPRECATED**: Market Monitor agent was removed. Market health monitoring is now the Supervisor's responsibility. This section is retained for historical reference only.
+
 **Role**: The "eyes on the dashboard" agent. Watches everything, flags anomalies.
 
 **Responsibilities**:

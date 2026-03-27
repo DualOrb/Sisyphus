@@ -36,13 +36,13 @@ Sisyphus is an autonomous AI dispatcher that operates the ValleyEats dispatch sy
 │    Delegates to specialized sub-agents                          │
 │    Uses process .md files for decision-making                   │
 │                                                                 │
-│    ┌──────────┐  ┌──────────┐  ┌──────────┐                    │
-│    │ Market   │  │ Driver   │  │ Customer │                    │
-│    │ Monitor  │  │ Comms    │  │ Support  │                    │
-│    │ Agent    │  │ Agent    │  │ Agent    │                    │
-│    └────┬─────┘  └────┬─────┘  └────┬─────┘                    │
-│         │             │             │                           │
-│         └─────────────┼─────────────┘                           │
+│    ┌──────────┐  ┌──────────┐                                  │
+│    │ Driver   │  │ Customer │                                  │
+│    │ Comms    │  │ Support  │                                  │
+│    │ Agent    │  │ Agent    │                                  │
+│    └────┬─────┘  └────┬─────┘                                  │
+│         │             │                                        │
+│         └──────┬──────┘                                        │
 │              Any agent can invoke ▼                              │
 │                  ┌──────────────┐                                │
 │                  │ Task Executor│  (shared utility agent)        │
@@ -179,9 +179,10 @@ The top-level agent that mirrors what a human dispatcher does moment-to-moment:
 
 ### 4.2 Sub-Agents
 
+> **Note:** Market Monitor was removed — market health monitoring is handled directly by the Supervisor agent.
+
 | Agent | Responsibility | Trigger |
 |-------|---------------|---------|
-| **Market Monitor** | Watches market health scores, driver-to-order ratios, ETAs. Flags issues proactively. | Continuous polling, threshold alerts |
 | **Driver Comms** | Handles all driver communication — responds to messages, sends instructions, follows up. | New driver message, assignment follow-up |
 | **Customer Support** | Resolves support tickets — investigates issues, applies resolutions, communicates with customers. | New ticket, ticket escalation |
 | **Task Executor** | Shared utility agent. Performs administrative tasks — updating restaurants, menu items, etc. Callable by any agent (not just supervisor). | Any agent delegation |

@@ -11,6 +11,7 @@ import {
   type GraphNode, type GraphLink, type PulseEffect, type LinkPulse,
 } from "../lib/graph-builder";
 import { createEntityIcon, type IconEntityType } from "../lib/procedural-icons";
+import { api } from "../api/client";
 import { StatusBadge } from "../components/StatusBadge";
 
 // ---------------------------------------------------------------------------
@@ -543,6 +544,21 @@ function DetailPanel({ node, onClose }: { node: GraphNode; onClose: () => void }
               </div>
             ))}
           </>}
+          {/* Linked customer */}
+          {r.customerId && <ExpandableSection title="Customer" fetchFn={() => api.customer(r.customerId)} render={(c: any) => <>
+            <R l="name" v={c.name} /><R l="email" v={c.email} /><R l="phone" v={c.phone} />
+            <R l="perks points" v={c.perksPoints?.toString()} /><R l="total orders" v={c.totalOrders?.toString()} />
+            <R l="app version" v={c.appVersion} />
+            {c.deliveryAddresses?.length > 0 && c.deliveryAddresses.map((a: any, i: number) => (
+              <div key={i} className="text-[9px] text-cyan-600/30 mt-1">{a.deliveryStreet}, {a.deliveryCity} {a.deliveryPostal}</div>
+            ))}
+            {c.messages?.length > 0 && <>
+              <div className="text-[9px] text-cyan-600/25 mt-1">{c.messages.length} in-app messages</div>
+              {c.messages.slice(0, 3).map((m: any, i: number) => (
+                <div key={i} className="text-[9px] text-cyan-600/30 truncate">{m.message}</div>
+              ))}
+            </>}
+          </>} />}
         </>}
 
         {/* DRIVER — full detail */}
@@ -566,6 +582,14 @@ function DetailPanel({ node, onClose }: { node: GraphNode; onClose: () => void }
             <R l="geo permission" v={r.appSettings.geoLocate} />
             <R l="camera" v={r.appSettings.camera} /><R l="phone perm" v={r.appSettings.phone} />
           </>}
+          {/* Linked conversation */}
+          {r.driverId && <ExpandableSection title="Conversation" fetchFn={() => api.conversation(r.driverId)} render={(c: any) => <>
+            <R l="last message" v={c.lastMessagePreview} />
+            <R l="last author" v={c.lastAuthor} />
+            <R l="from driver" v={c.lastMessageFromDriver ? "yes" : "no"} />
+            <R l="unread" v={c.hasUnread ? "yes" : "no"} />
+            <R l="last at" v={fmtTime(c.lastMessageAt)} />
+          </>} />}
         </>}
 
         {/* RESTAURANT — full detail */}
@@ -640,6 +664,38 @@ function DetailPanel({ node, onClose }: { node: GraphNode; onClose: () => void }
           </>}
         </>}
       </div>
+    </div>
+  );
+}
+
+function ExpandableSection({ title, fetchFn, render }: { title: string; fetchFn: () => Promise<any>; render: (data: any) => React.ReactNode }) {
+  const [open, setOpen] = useState(false);
+  const [data, setData] = useState<any>(null);
+  const [loading, setLoading] = useState(false);
+  const [error, setError] = useState(false);
+
+  const toggle = () => {
+    if (!open && !data && !loading) {
+      setLoading(true);
+      setError(false);
+      fetchFn().then(d => { setData(d); setLoading(false); }).catch(() => { setError(true); setLoading(false); });
+    }
+    setOpen(!open);
+  };
+
+  return (
+    <div className="mt-2 border border-cyan-900/15 rounded overflow-hidden">
+      <button onClick={toggle} className="w-full flex items-center justify-between px-2 py-1.5 text-[9px] text-cyan-500/40 uppercase tracking-wider hover:bg-cyan-900/10 transition-colors">
+        <span>{title}</span>
+        <span className="text-cyan-700/30">{open ? "▾" : "▸"}</span>
+      </button>
+      {open && (
+        <div className="px-2 py-1.5 border-t border-cyan-900/10 space-y-1">
+          {loading && <p className="text-[9px] text-cyan-800/25">loading...</p>}
+          {error && <p className="text-[9px] text-red-400/50">not found</p>}
+          {data && render(data)}
+        </div>
+      )}
     </div>
   );
 }

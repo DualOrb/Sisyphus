@@ -43,6 +43,8 @@ export const api = {
     const qs = q.toString();
     return get<any[]>(`/api/conversations${qs ? `?${qs}` : ""}`);
   },
+  customer: (email: string) => get<any>(`/api/customers/${encodeURIComponent(email)}`),
+  conversation: (driverId: string) => get<any>(`/api/conversations/${encodeURIComponent(driverId)}`),
   audit: (limit?: number) =>
     get<any[]>(`/api/audit${limit ? `?limit=${limit}` : ""}`),
 };

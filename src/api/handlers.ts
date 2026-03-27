@@ -155,6 +155,14 @@ export function createDashboardRoutes(deps: DashboardDeps): ApiRouter {
     json(res, ticket);
   });
 
+  // ---- Customers ----------------------------------------------------------
+
+  router.get("/api/customers/:email", (_req, res, ctx) => {
+    const customer = store.getCustomer(ctx.params.email);
+    if (!customer) return notFound(res);
+    json(res, customer);
+  });
+
   // ---- Conversations ------------------------------------------------------
 
   router.get("/api/conversations", (_req, res, ctx) => {
@@ -162,6 +170,12 @@ export function createDashboardRoutes(deps: DashboardDeps): ApiRouter {
     const hasUnread = unreadParam === "true" ? true : undefined;
     const conversations = store.queryConversations({ hasUnread });
     json(res, conversations);
+  });
+
+  router.get("/api/conversations/:driverId", (_req, res, ctx) => {
+    const convo = store.getConversation(ctx.params.driverId);
+    if (!convo) return notFound(res);
+    json(res, convo);
   });
 
   // ---- Audit log ----------------------------------------------------------

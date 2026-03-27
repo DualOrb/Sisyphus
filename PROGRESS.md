@@ -81,7 +81,7 @@
 - [x] ChatOpenAI factory with task-type model routing
 - [x] createAgentNode() — react-style tool loop (LLM → tool → repeat)
 - [x] Supervisor agent — routes to sub-agents via route_to_agent tool pattern
-- [x] Market Monitor agent — filtered tools for health monitoring
+- [x] ~~Market Monitor agent~~ — **removed; market health monitoring consolidated into Supervisor agent**
 - [x] Driver Comms agent — filtered tools for driver messaging
 - [x] Customer Support agent — filtered tools for ticket resolution
 - [x] Task Executor agent — shared utility callable by any agent
