@@ -8,6 +8,7 @@
  */
 
 import { z } from "zod";
+import { GeoPointSchema } from "./common.js";
 import { DriverStatus, AppPermissionLevel } from "./enums.js";
 
 // ---------------------------------------------------------------------------
@@ -69,6 +70,10 @@ export const DriverSchema = z.object({
   // ---- Training ----
   /** Number of completed training orders */
   trainingOrders: z.number().int().optional().describe("DynamoDB: TrainingOrders"),
+
+  // ---- Location ----
+  /** Last-known GPS position from dispatch.txt DriverLocation field */
+  currentLocation: GeoPointSchema.nullable().describe("dispatch.txt: DriverLocation — last-known GPS"),
 
   // ---- Computed properties (populated during ontology sync) ----
   /**

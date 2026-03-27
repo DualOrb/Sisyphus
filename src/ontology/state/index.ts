@@ -11,3 +11,10 @@ export {
   type RestaurantFilter,
   type ConversationFilter,
 } from "./store.js";
+
+export {
+  DriverLocationHistory,
+  haversineMeters,
+  type LocationSnapshot,
+  type DriverLocationSummary,
+} from "./location-history.js";

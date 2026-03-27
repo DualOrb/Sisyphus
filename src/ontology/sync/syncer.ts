@@ -12,6 +12,7 @@
 import type { Logger } from "../../lib/logger.js";
 import type { DispatchApiClient } from "./dispatch-api.js";
 import type { OntologyStore } from "../state/store.js";
+import type { DriverLocationHistory } from "../state/location-history.js";
 import type { OntologySyncSource } from "../../adapters/types.js";
 
 import {
@@ -44,6 +45,7 @@ export class OntologySyncer {
   private readonly log: Logger;
   private intervalHandle: ReturnType<typeof setInterval> | null = null;
   private _isSyncing = false;
+  private locationHistory: DriverLocationHistory | null = null;
 
   /**
    * Optional adapter-based data source. When set, the syncer uses this
@@ -89,6 +91,14 @@ export class OntologySyncer {
   }
 
   // ---- Public API -----------------------------------------------------------
+
+  /**
+   * Attach a DriverLocationHistory instance. When set, the syncer will
+   * record driver locations after every sync cycle and prune stale entries.
+   */
+  setLocationHistory(history: DriverLocationHistory): void {
+    this.locationHistory = history;
+  }
 
   /** Whether a sync cycle is currently in progress. */
   get isSyncing(): boolean {
@@ -222,6 +232,9 @@ export class OntologySyncer {
       this.enrichDriverOrderCounts();
       this.enrichRestaurantLoad();
       this.enrichMarketActiveOrders();
+
+      // -- Record driver locations for history tracking --
+      this.recordDriverLocations();
 
       this.store.markSynced();
 
@@ -393,6 +406,9 @@ export class OntologySyncer {
       this.enrichRestaurantLoad();
       this.enrichMarketActiveOrders();
 
+      // Record driver locations for history tracking
+      this.recordDriverLocations();
+
       this.store.markSynced();
 
       const durationMs = Date.now() - startMs;
@@ -558,5 +574,16 @@ export class OntologySyncer {
       (market as any).driverToOrderRatio =
         activeOrders > 0 ? market.availableDrivers / activeOrders : null;
     }
+  }
+
+  /**
+   * Record all current driver locations into the location history tracker.
+   * Also prunes stale entries. No-op if no history tracker is attached.
+   */
+  private recordDriverLocations(): void {
+    if (!this.locationHistory) return;
+
+    this.locationHistory.recordFromDrivers(this.store.drivers.values());
+    this.locationHistory.prune();
   }
 }

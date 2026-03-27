@@ -242,6 +242,10 @@ export function transformDriver(raw: any): Driver {
 
     trainingOrders: raw?.TrainingOrders != null ? int(raw.TrainingOrders) : undefined,
 
+    currentLocation: raw?.DriverLocation?.latitude != null
+      ? { latitude: num(raw.DriverLocation.latitude), longitude: num(raw.DriverLocation.longitude) }
+      : null,
+
     // Computed
     status,
     isOnline,
