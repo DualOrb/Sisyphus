@@ -205,6 +205,11 @@ export class ActionLedger {
     ).length;
   }
 
+  /** Check if any action has been taken on an entity. */
+  hasEntity(entityId: string): boolean {
+    return this.entries.some((e) => e.entityId === entityId);
+  }
+
   /** Get the total entry count. */
   get size(): number {
     return this.entries.length;

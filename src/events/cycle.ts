@@ -343,27 +343,42 @@ export class DispatchCycle {
     if (dispatchData) {
       combinedPrompt += buildChangesPrompt(changes, dispatchData, this.isFirstCycle);
 
-      // Append open ticket summary — annotate tickets already dispatched
+      // Append open ticket summary — only show tickets that haven't been handled yet
       const ticketCount = this.store.tickets.size;
       if (ticketCount > 0) {
-        const ticketLines: string[] = [`\n-- Open Tickets (${ticketCount}) --`];
+        const ticketLines: string[] = [];
+        let shownCount = 0;
+        let skippedCount = 0;
         for (const t of this.store.tickets.values()) {
+          // Skip tickets already acted on in the ledger (resolved, noted, escalated)
+          if (this.ledger.hasEntity(t.issueId)) {
+            skippedCount++;
+            continue; // Already handled — don't show to supervisor
+          }
+
+          // Only show unassigned tickets (actionable by customer_support)
+          if (t.owner !== "Unassigned") {
+            skippedCount++;
+            continue;
+          }
+
           const age = Math.round((Date.now() - t.createdAt.getTime()) / 60000);
-          const alreadyHandled = this.dispatchedIssues.has(`ticket:${t.issueId}`);
-          const annotation = alreadyHandled
-            ? " [ALREADY DISPATCHED — do NOT re-dispatch unless status changed]"
-            : "";
-          const ownerLabel = t.owner === "Unassigned" ? "UNASSIGNED" : `owner: ${t.owner}`;
           const orderRef = t.orderIdKey ? ` | order: ${t.orderIdKey}` : "";
           ticketLines.push(
-            `  ticket ${t.issueId}: [${t.status}] [${ownerLabel}] ${t.category} / ${t.issueType} -- ${t.restaurantName ?? t.originator}${orderRef} (${age}m old)${annotation}`,
+            `  ticket ${t.issueId}: [${t.status}] [UNASSIGNED] ${t.category} / ${t.issueType} -- ${t.restaurantName ?? t.originator}${orderRef} (${age}m old)`,
           );
-          // Mark as dispatched so next cycle annotates it
-          if (!alreadyHandled) {
-            this.dispatchedIssues.set(`ticket:${t.issueId}`, Date.now());
-          }
+          shownCount++;
+
+          // Mark as dispatched for dedup tracking
+          this.dispatchedIssues.set(`ticket:${t.issueId}`, Date.now());
         }
-        combinedPrompt += "\n" + ticketLines.join("\n") + "\n";
+        if (shownCount > 0) {
+          combinedPrompt += `\n-- Open Tickets Needing Resolution (${shownCount}) --\n`;
+          combinedPrompt += ticketLines.join("\n") + "\n";
+        }
+        if (skippedCount > 0) {
+          combinedPrompt += `(${skippedCount} ticket(s) already handled or assigned — not shown)\n`;
+        }
       }
     }
 
@@ -932,7 +947,7 @@ function buildChangesPrompt(
 
         const status = deriveOrderStatus(o);
         const isUnassigned = !o.DriverId;
-        const hasOfflineDriver = driver && !driver.OnShift && !driverIsOffline;
+        const hasOfflineDriver = !!driverIsOffline;
 
         // Skip recently confirmed unassigned orders — the router will assign
         // a driver shortly. Only surface after 2 minutes without assignment.
@@ -1031,7 +1046,7 @@ function buildChangesPrompt(
 
         const status = deriveOrderStatus(o);
         const isUnassigned = !o.DriverId;
-        const hasOfflineDriver = driver && !driver.OnShift && !driverIsOffline;
+        const hasOfflineDriver = !!driverIsOffline;
 
         // Skip recently confirmed unassigned orders — the router will assign
         // a driver shortly. Only surface after 2 minutes without assignment.
@@ -1070,21 +1085,15 @@ function buildFocusAreas(store: OntologyStore): string {
     (m) => allDrivers.some((d) => d.dispatchZone === m.market && d.isOnline),
   ).length;
 
-  const focusList: string[] = [];
-
-  if (activeOrders > 0) focusList.push("order monitoring & assignment");
-  if (openTickets > 0) focusList.push("ticket resolution");
-  if (driversOnShift > 0) focusList.push("driver communication & scheduling");
-  if (activeMarkets > 0) focusList.push("market health monitoring");
-  if (focusList.length === 0) focusList.push("general oversight (quiet period)");
-
+  // Stats only — no "focus on" instructions. The supervisor already has its
+  // routing rules in the system prompt. Adding "focus on: monitoring" here
+  // directly contradicts the "you are the monitor, don't delegate monitoring" rule.
   const lines = [
-    `\n-- FOCUS AREAS --`,
-    `Active orders: ${activeOrders > 0 ? `yes (${activeOrders})` : "no"}`,
-    `Open tickets: ${openTickets > 0 ? `yes (${openTickets})` : "no"}`,
+    `\n-- CURRENT STATS --`,
+    `Active delivery orders: ${activeOrders}`,
+    `Open unresolved tickets: ${openTickets}`,
     `Drivers on shift: ${driversOnShift}`,
-    `Active markets with drivers: ${activeMarkets}`,
-    `Focus on: ${focusList.join(", ")}`,
+    `Active markets: ${activeMarkets}`,
   ];
 
   return lines.join("\n");
