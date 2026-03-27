@@ -124,7 +124,7 @@ function fakeProposals(): Proposal[] {
       reasoning:
         "Perth has 8 pending orders but only 2 active drivers. Expanding zone radius " +
         "to pull in drivers from adjacent areas.",
-      agentId: "market-monitor",
+      agentId: "supervisor",
       validationResult: { passed: true },
     },
     // YELLOW tier — message driver

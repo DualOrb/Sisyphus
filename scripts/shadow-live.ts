@@ -28,13 +28,15 @@ import { registerAllActions } from "../src/ontology/actions/index.js";
 import { createDispatchGraph } from "../src/agents/graph.js";
 import { DispatchCycle } from "../src/events/cycle.js";
 import { EventQueue } from "../src/events/queue.js";
-import { createRedisClient } from "../src/memory/redis/client.js";
+import { createRedisClient, type RedisClient } from "../src/memory/redis/client.js";
 import { createPostgresClient } from "../src/memory/postgres/client.js";
 import { writeAuditRecord } from "../src/memory/postgres/queries.js";
 import { ShadowExecutor } from "../src/execution/shadow/executor.js";
 import { ShadowMetrics } from "../src/execution/shadow/metrics.js";
 import { startHealthServer } from "../src/health/server.js";
 import { checkRedis, checkOntologyStore, aggregateHealth } from "../src/health/checks.js";
+import { SseManager } from "../src/api/sse.js";
+import { createDashboardRoutes } from "../src/api/handlers.js";
 import { generateShiftReport } from "../src/shift/report.js";
 import { formatReportAsMarkdown } from "../src/shift/report-formatter.js";
 import { formatReportAsJson } from "../src/shift/report-formatter-json.js";
@@ -77,6 +79,23 @@ function logBoth(text: string) {
 
 function logFile(text: string) {
   appendFileSync(LOG_FILE, text + "\n");
+}
+
+// ---------------------------------------------------------------------------
+// Redis flush — clear stale keys so each shadow-live session starts clean
+// ---------------------------------------------------------------------------
+
+async function flushSisyphusRedis(redis: RedisClient): Promise<void> {
+  const patterns = ["cooldown:*", "lock:*", "circuitbreaker:*", "actions:*", "heartbeat:*"];
+  let totalDeleted = 0;
+  for (const pattern of patterns) {
+    const keys = await redis.keys(pattern);
+    if (keys.length > 0) {
+      await redis.del(...keys);
+      totalDeleted += keys.length;
+    }
+  }
+  log.info({ totalDeleted }, "Flushed stale Redis keys for fresh shadow-live session");
 }
 
 // ---------------------------------------------------------------------------
@@ -145,6 +164,9 @@ async function main() {
   logBoth(`  [${now()}] Connecting Redis...`);
   const redis = createRedisClient(process.env.REDIS_URL ?? "redis://localhost:6379/0");
 
+  logBoth(`  [${now()}] Flushing stale Redis keys...`);
+  await flushSisyphusRedis(redis);
+
   logBoth(`  [${now()}] Connecting PostgreSQL...`);
   const db = createPostgresClient(
     process.env.POSTGRES_URL ?? "postgresql://sisyphus:sisyphus@localhost:5432/sisyphus",
@@ -158,6 +180,8 @@ async function main() {
   const syncer = new OntologySyncer(null as any, store, log);
   const shadowMetrics = new ShadowMetrics();
   const shadowExecutor = new ShadowExecutor();
+  const sseManager = new SseManager();
+  const eventQueue = new EventQueue();
 
   // ---- Audit callback ----
   const onAudit = async (record: AuditRecord) => {
@@ -188,10 +212,23 @@ async function main() {
     } catch (err: any) {
       log.warn({ err: err.message }, "Audit write failed");
     }
-    logFile(`#### Audit [${now()}] ${record.actionType} → ${record.outcome} (${record.executionTimeMs}ms)`);
+    const entityId = (record.params as any)?.driverId
+      ?? (record.params as any)?.orderId
+      ?? (record.params as any)?.ticketId ?? "";
+    // Broadcast to dashboard
+    sseManager.broadcast("audit", {
+      actionType: record.actionType,
+      outcome: record.outcome,
+      agentId: record.agentId,
+      entityId,
+      executionTimeMs: record.executionTimeMs,
+      timestamp: record.timestamp,
+    });
+
     const color = record.outcome === "executed" ? "\x1b[32m"
       : record.outcome === "staged" ? "\x1b[33m" : "\x1b[31m";
-    logBoth(`    ${color}AUDIT: ${record.actionType} → ${record.outcome}\x1b[0m`);
+    logBoth(`  ${color}[${now()}] AUDIT: ${record.actionType} → ${record.outcome} | ${entityId}\x1b[0m`);
+    logFile(`[${now()}] AUDIT: ${record.actionType} → ${record.outcome} | entity: ${entityId} | reason: ${record.reasoning?.slice(0, 100) ?? ""}`);
   };
 
   // ---- Build graph ----
@@ -209,19 +246,103 @@ async function main() {
       hasNewMessages: true,
     },
     onAgentActivity: (entry) => {
-      const prefix = `  [${entry.agent}] i${entry.iteration}`;
+      const ts = now();
+      const prefix = `[${ts}] [${entry.agent}]`;
+
+      // --- Extract entity IDs from content for dashboard highlighting ---
+      const driverMatch = entry.content.match(/"driverId":"([^"]+)"/);
+      const orderMatch = entry.content.match(/"orderId":"([^"]+)"/);
+      const ticketMatch = entry.content.match(/"ticketId":"([^"]+)"/) ?? entry.content.match(/"issueId":"([^"]+)"/);
+      const marketMatch = entry.content.match(/"market":"([^"]+)"/);
+      const entityIds: string[] = [];
+      if (driverMatch) entityIds.push(`driver:${driverMatch[1]}`);
+      if (orderMatch) entityIds.push(`order:${orderMatch[1]}`);
+      if (ticketMatch) entityIds.push(`ticket:${ticketMatch[1]}`);
+      if (marketMatch) entityIds.push(`market:${marketMatch[1]}`);
+
       if (entry.type === "tool_call") {
-        logBoth(`${prefix} 🔧 ${entry.content.slice(0, 120)}`);
-        logFile(`${prefix} FULL_TOOL_CALL: ${entry.content}`);
+        // For assign_tasks / ASSIGN, show the routing decision clearly
+        if (entry.content.startsWith("assign_tasks") || entry.content.startsWith("ASSIGN")) {
+          logBoth(`${prefix} ROUTE: ${entry.content}`);
+          sseManager.broadcast("activity", {
+            kind: "route", agent: entry.agent, entityIds,
+            summary: entry.content.slice(0, 200),
+          });
+        }
+        // For execute_action, show what action is being taken
+        else if (entry.content.startsWith("execute_action")) {
+          const actionMatch2 = entry.content.match(/"actionName":"(\w+)"/);
+          const msgMatch = entry.content.match(/"message":"([^"]{0,80})/);
+          const action = actionMatch2?.[1] ?? "?";
+          const target = driverMatch?.[1] ?? orderMatch?.[1] ?? "";
+          const msg = msgMatch?.[1] ?? "";
+          const summary = msg ? `${action} → ${target}: "${msg}..."` : `${action} → ${target}`;
+          logBoth(`${prefix} ACTION: ${summary}`);
+          logFile(`${prefix} ACTION: ${entry.content}`);
+          sseManager.broadcast("activity", {
+            kind: "action", agent: entry.agent, entityIds,
+            summary, actionName: action,
+          });
+        }
+        // For lookup_process, just note the query
+        else if (entry.content.startsWith("lookup_process")) {
+          const queryMatch = entry.content.match(/"query":"([^"]+)"/);
+          logFile(`${prefix} LOOKUP: ${queryMatch?.[1] ?? entry.content.slice(0, 80)}`);
+          sseManager.broadcast("activity", {
+            kind: "lookup", agent: entry.agent, entityIds: [],
+            summary: queryMatch?.[1] ?? "process lookup",
+          });
+        }
+        // For queries, broadcast with entity IDs so we highlight what the AI is looking at
+        else if (entry.content.startsWith("query_") || entry.content.startsWith("get_")) {
+          logFile(`${prefix} QUERY: ${entry.content.slice(0, 120)}`);
+          const toolName = entry.content.split("(")[0];
+          sseManager.broadcast("activity", {
+            kind: "query", agent: entry.agent, entityIds,
+            summary: toolName,
+          });
+        }
+        // For request_clarification, show it
+        else if (entry.content.startsWith("request_clarification")) {
+          logBoth(`${prefix} ESCALATE: ${entry.content.slice(0, 150)}`);
+          sseManager.broadcast("activity", {
+            kind: "escalate", agent: entry.agent, entityIds,
+            summary: entry.content.slice(0, 150),
+          });
+        }
+        else {
+          logFile(`${prefix} TOOL: ${entry.content.slice(0, 120)}`);
+        }
       } else if (entry.type === "tool_result") {
-        logBoth(`${prefix} → ${entry.content.slice(0, 120)}`);
-        logFile(`${prefix} FULL_RESULT: ${entry.content}`);
+        // Only log outcomes for execute_action, skip verbose query results
+        if (entry.content.includes("execute_action →") || entry.content.includes("→ {\"success\"")) {
+          const outcomeMatch = entry.content.match(/"outcome":"(\w+)"/);
+          const reasonMatch = entry.content.match(/"reason":"([^"]{0,100})"/);
+          const outcome = outcomeMatch?.[1] ?? "?";
+          if (outcome === "executed" || outcome === "staged") {
+            logBoth(`${prefix} ✓ ${outcome}`);
+          } else {
+            logBoth(`${prefix} ✗ ${outcome}: ${reasonMatch?.[1]?.slice(0, 80) ?? ""}`);
+          }
+          sseManager.broadcast("activity", {
+            kind: "result", agent: entry.agent, entityIds,
+            summary: `${outcome}${reasonMatch?.[1] ? `: ${reasonMatch[1].slice(0, 60)}` : ""}`,
+            outcome,
+          });
+        }
       } else if (entry.type === "response") {
-        logBoth(`${prefix} 💬 ${entry.content.slice(0, 120)}`);
-        logFile(`${prefix} FULL_RESPONSE:\n${entry.content}\n---`);
+        const firstLine = entry.content.split("\n").find((l: string) => l.trim().length > 0) ?? "";
+        logBoth(`${prefix} DONE: ${firstLine.slice(0, 120)}`);
+        sseManager.broadcast("activity", {
+          kind: "done", agent: entry.agent, entityIds: [],
+          summary: firstLine.slice(0, 120),
+        });
       } else if (entry.type === "summary") {
-        logBoth(`${prefix} 📋 ${entry.content.slice(0, 120)}`);
-        logFile(`${prefix} FULL_SUMMARY:\n${entry.content}\n---`);
+        logBoth(`${prefix} SUMMARY: ${entry.content.slice(0, 120)}`);
+        sseManager.broadcast("activity", {
+          kind: "summary", agent: entry.agent, entityIds: [],
+          summary: entry.content.slice(0, 120),
+        });
       }
     },
   });
@@ -230,21 +351,39 @@ async function main() {
   const dispatchCycle = new DispatchCycle({
     store,
     graph,
-    eventQueue: new EventQueue(),
+    eventQueue,
     messageListener: null,
     redis,
     shiftId: sessionId,
     operatingMode: "shadow",
   });
 
-  // ---- Health server ----
+  // ---- Health server + dashboard API ----
   let healthServer: http.Server | null = null;
   try {
-    healthServer = startHealthServer(3000, async () => {
+    const getHealth = async () => {
       const components = [await checkRedis(redis), checkOntologyStore(store)];
       return aggregateHealth(components);
+    };
+
+    const dashboardRouter = createDashboardRoutes({
+      store,
+      getHealth,
+      getShiftStats: () => ({
+        shiftStartedAt: new Date(startTime).toISOString(),
+        dispatchCycles: cycleCount,
+        ontologySyncs: syncCount,
+        actionsExecuted: auditRecords.length,
+        errorsEncountered: errorCount,
+        browserReconnections: 0,
+      }),
+      getEventQueueSize: () => eventQueue.size,
+      db,
+      sse: sseManager,
     });
-    logBoth(`  [${now()}] Health server on :3000`);
+
+    healthServer = startHealthServer(3000, getHealth, {}, dashboardRouter);
+    logBoth(`  [${now()}] Health + dashboard API on :3000`);
   } catch { /* non-fatal */ }
 
   logBoth(`\n  \x1b[32m[${now()}] Ready.\x1b[0m\n`);
@@ -265,6 +404,9 @@ async function main() {
       const data = await fetchDispatchFile();
       latestDispatchData = data;
       syncer.syncFromDispatchFile(data);
+
+      // Broadcast sync to dashboard
+      sseManager.broadcast("sync", store.getStats());
 
       // Tickets every 3rd sync
       if (syncCount === 1 || syncCount % 3 === 0) {
@@ -290,11 +432,20 @@ async function main() {
     try {
       const result = await dispatchCycle.run(latestDispatchData);
 
+      // Broadcast cycle result to dashboard
+      sseManager.broadcast("cycle", {
+        cycleNumber: cycleCount,
+        graphInvoked: result.graphInvoked,
+        reason: result.reason,
+        changesDetected: result.changesDetected,
+        eventsProcessed: result.eventsProcessed,
+        duration: result.duration,
+      });
+
       if (result.graphInvoked) {
-        logBoth(`  \x1b[32m[${now()}] Cycle #${cycleCount}: ${result.reason} — ${result.changesDetected} changes, ${result.eventsProcessed} events\x1b[0m`);
-        if (result.summary) {
-          logFile(`\n### Cycle #${cycleCount} [${now()}]\n${result.summary}\n`);
-        }
+        const duration = ((result.duration ?? 0) / 1000).toFixed(1);
+        logBoth(`\n  \x1b[32m[${now()}] ── Cycle #${cycleCount} done (${duration}s) ── ${result.reason} | ${result.changesDetected} changes\x1b[0m`);
+        logFile(`\n── Cycle #${cycleCount} [${now()}] (${duration}s) ── ${result.reason} | ${result.changesDetected} changes\n`);
       } else if (result.changesDetected > 0) {
         logBoth(`  [${now()}] ${result.changesDetected} changes (cooldown)`);
       } else {
@@ -348,6 +499,7 @@ async function main() {
       log.warn({ err: err.message }, "Shift report failed");
     }
 
+    sseManager.shutdown();
     healthServer?.close();
     redis.disconnect();
     process.exit(0);
