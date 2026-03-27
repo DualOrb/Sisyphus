@@ -17,6 +17,8 @@ import { DynamicStructuredTool } from "@langchain/core/tools";
 import { z } from "zod";
 import type { Redis as RedisClient } from "ioredis";
 import type { OntologyStore } from "../ontology/state/index.js";
+import type { DriverLocationHistory } from "../ontology/state/location-history.js";
+import { haversineMeters } from "../ontology/state/location-history.js";
 import { executeAction } from "../guardrails/index.js";
 import type { ExecutionContext } from "../guardrails/index.js";
 import { createChildLogger } from "../lib/index.js";
@@ -55,7 +57,8 @@ export function createOntologyTools(
     name: "query_orders",
     description:
       "Query orders from the ontology with optional filters. Returns an array of order summaries " +
-      "including orderId, orderIdKey, status, restaurantName, driverId, deliveryZone, placedAt, and isLate. " +
+      "including orderId, orderIdKey, status, restaurantName, driverId, deliveryZone, placedAt, isLate, " +
+      "deliveryDistance (meters), and a location summary string with restaurant→customer coordinates. " +
       "Use this to find orders matching specific criteria (e.g., all late orders in a zone, " +
       "all orders assigned to a specific driver).",
     schema: z.object({
@@ -73,7 +76,7 @@ export function createOntologyTools(
         .string()
         .nullable().optional()
         .describe("Filter by assigned driver ID (email address)"),
-    }),
+    }).passthrough(),
     func: async (input) => {
       try {
         const orders = store.queryOrders({
@@ -82,17 +85,27 @@ export function createOntologyTools(
           driverId: input.driverId ?? undefined,
         });
 
-        const summaries = orders.map((o) => ({
-          orderId: o.orderId,
-          orderIdKey: o.orderIdKey,
-          status: o.status,
-          restaurantName: o.restaurantName,
-          driverId: o.driverId,
-          deliveryZone: o.deliveryZone,
-          placedAt: o.placedAt.toISOString(),
-          isLate: o.isLate,
-          waitTimeMinutes: o.waitTimeMinutes,
-        }));
+        const summaries = orders.map((o) => {
+          // Build a location summary string when both endpoints exist
+          const loc =
+            o.orderLocation && o.customerLocation
+              ? `Restaurant: ${o.orderLocation.latitude},${o.orderLocation.longitude} → Customer: ${o.customerLocation.latitude},${o.customerLocation.longitude}`
+              : null;
+
+          return {
+            orderId: o.orderId,
+            orderIdKey: o.orderIdKey,
+            status: o.status,
+            restaurantName: o.restaurantName,
+            driverId: o.driverId,
+            deliveryZone: o.deliveryZone,
+            placedAt: o.placedAt.toISOString(),
+            isLate: o.isLate,
+            waitTimeMinutes: o.waitTimeMinutes,
+            deliveryDistance: o.deliveryDistance ?? null,
+            location: loc,
+          };
+        });
 
         return JSON.stringify({ count: summaries.length, orders: summaries });
       } catch (err) {
@@ -118,25 +131,17 @@ export function createOntologyTools(
       "Use 'isOnline' to check if a driver is actually on-shift and available for dispatch. " +
       "To find all working drivers in a zone, query WITHOUT isAvailable filter and check isOnline in results.",
     schema: z.object({
-      dispatchZone: z
-        .string()
-        .nullable().optional()
-        .describe("Filter by dispatch zone name"),
-      isAvailable: z.preprocess(
-        (v) => (v === "null" || v === "undefined" || v === "" ? undefined : v),
-        z.boolean().nullable().optional(),
-      ).describe("Filter by on-call toggle (NOT whether driver is working — use isOnline for that). Omit to return all."),
-      isOnline: z.preprocess(
-        (v) => (v === "null" || v === "undefined" || v === "" ? undefined : v),
-        z.boolean().nullable().optional(),
-      ).describe("Filter by whether driver is currently on-shift and working. Omit to return all."),
-    }),
+      dispatchZone: z.string().optional().describe("Filter by dispatch zone name. Omit to return all zones."),
+      isOnline: z.boolean().optional().describe("Filter by on-shift status. true = working drivers only. Omit to return all."),
+    }).passthrough(),
     func: async (input) => {
       try {
+        // Clean inputs — models sometimes pass "null" strings or empty strings
+        const zone = input.dispatchZone && input.dispatchZone !== "null" ? input.dispatchZone : undefined;
+        const online = typeof input.isOnline === "boolean" ? input.isOnline : undefined;
         const drivers = store.queryDrivers({
-          dispatchZone: input.dispatchZone ?? undefined,
-          isAvailable: input.isAvailable ?? undefined,
-          isOnline: input.isOnline ?? undefined,
+          dispatchZone: zone,
+          isOnline: online,
         });
 
         const summaries = drivers.map((d) => ({
@@ -144,11 +149,11 @@ export function createOntologyTools(
           name: d.name,
           monacher: d.monacher ?? null,
           dispatchZone: d.dispatchZone,
-          isAvailable: d.isAvailable,
-          isPaused: d.isPaused,
           isOnline: d.isOnline,
+          isPaused: d.isPaused,
           status: d.status,
           activeOrdersCount: d.activeOrdersCount,
+          currentLocation: d.currentLocation ?? null,
         }));
 
         return JSON.stringify({
@@ -185,7 +190,7 @@ export function createOntologyTools(
         .string()
         .nullable().optional()
         .describe('Filter by assigned owner (email or "Unassigned")'),
-    }),
+    }).passthrough(),
     func: async (input) => {
       try {
         const tickets = store.queryTickets({
@@ -230,13 +235,15 @@ export function createOntologyTools(
     name: "get_order_details",
     description:
       "Get full details for a specific order including linked entities: customer name, driver name, " +
-      "restaurant info, and related support tickets. Use this when you need complete context about " +
-      "an order before making a decision. Accepts either the full OrderId UUID or the 8-character OrderIdKey.",
+      "restaurant info, and related support tickets. Includes geo coordinates (customerLocation, " +
+      "orderLocation as lat/lng) and deliveryDistance in meters when available. Use this when you " +
+      "need complete context about an order before making a decision. Accepts either the full " +
+      "OrderId UUID or the 8-character OrderIdKey.",
     schema: z.object({
       orderId: z
         .string()
         .describe("The order ID to look up — either the full UUID (e.g. '19c2d965-0828-4d67-af20-3c193b12f23f') or the 8-char short key (e.g. '19c2d965')"),
-    }),
+    }).passthrough(),
     func: async (input) => {
       try {
         const order = store.getOrder(input.orderId);
@@ -296,6 +303,13 @@ export function createOntologyTools(
               quantity: i.quantity,
             })),
             totalCents: order.total,
+            customerLocation: order.customerLocation
+              ? { latitude: order.customerLocation.latitude, longitude: order.customerLocation.longitude }
+              : null,
+            orderLocation: order.orderLocation
+              ? { latitude: order.orderLocation.latitude, longitude: order.orderLocation.longitude }
+              : null,
+            deliveryDistance: order.deliveryDistance ?? null,
           },
           customer: customer
             ? {
@@ -313,6 +327,7 @@ export function createOntologyTools(
                 dispatchZone: driver.dispatchZone,
                 isOnline: driver.isOnline,
                 activeOrdersCount: driver.activeOrdersCount,
+                currentLocation: driver.currentLocation ?? null,
               }
             : null,
           restaurant: restaurant
@@ -366,7 +381,7 @@ export function createOntologyTools(
         .describe(
           "How many hours of history to retrieve (default: 2)",
         ),
-    }),
+    }).passthrough(),
     func: async (input) => {
       try {
         const key = `actions:${input.entityType}:${input.entityId}`;
@@ -455,7 +470,7 @@ export function createOntologyTools(
         .describe(
           "Your explanation of why you are taking this action. This is logged to the audit trail.",
         ),
-    }),
+    }).passthrough(),
     func: async (input) => {
       // ------------------------------------------------------------------
       // Entity locking for parallel safety
@@ -482,7 +497,7 @@ export function createOntologyTools(
             );
             return JSON.stringify({
               skipped: true,
-              reason: `Entity ${entityType}:${entityId} is being handled by ${holder}. Skipping to avoid conflict.`,
+              reason: `Entity ${entityType}:${entityId} is currently locked by ${holder}. Your action was NOT executed. Do NOT retry — include this in your summary so the supervisor can handle it on the next cycle.`,
             });
           }
 
@@ -563,7 +578,7 @@ export function createOntologyTools(
         .boolean()
         .nullable().optional()
         .describe("Filter by whether restaurant is currently within kitchen hours"),
-    }),
+    }).passthrough(),
     func: async (input) => {
       try {
         const restaurants = store.queryRestaurants({
@@ -613,7 +628,7 @@ export function createOntologyTools(
         .boolean()
         .nullable().optional()
         .describe("Filter by unread status (true = only conversations with unread messages)"),
-    }),
+    }).passthrough(),
     func: async (input) => {
       try {
         const conversations = store.queryConversations({
@@ -675,7 +690,7 @@ export function createOntologyTools(
           "Urgency level. 'critical' = safety issue or major customer impact, " +
           "'high' = time-sensitive, 'normal' = can wait for next check cycle",
         ),
-    }),
+    }).passthrough(),
     func: async (input) => {
       try {
         // Store the clarification request in Redis for the supervisor to pick up
@@ -744,7 +759,7 @@ export function createOntologyTools(
       ticketId: z
         .string()
         .describe("The 8-character hash ID of the ticket (e.g. '7645aca1')"),
-    }),
+    }).passthrough(),
     func: async (input) => {
       try {
         const ticket = store.getTicket(input.ticketId);
@@ -845,7 +860,7 @@ export function createOntologyTools(
       endTime: z
         .string()
         .describe("End of the time window as ISO datetime (e.g. '2026-03-26T16:00:00')"),
-    }),
+    }).passthrough(),
     func: async (input) => {
       try {
         if (!dynamoClient) {
@@ -923,6 +938,268 @@ export function createOntologyTools(
     executeActionTool,
     requestClarificationTool,
   ];
+}
+
+// ---------------------------------------------------------------------------
+// Location history tools
+// ---------------------------------------------------------------------------
+
+/**
+ * Create tools that give AI agents access to driver location history.
+ * Returns an empty array if no location history is provided.
+ */
+export function createLocationHistoryTools(
+  locationHistory: DriverLocationHistory | null,
+  store: OntologyStore,
+): DynamicStructuredTool[] {
+  if (!locationHistory) return [];
+
+  // ----------------------------------------------------------------
+  // analyze_driver_movement — High-level situational assessment
+  // ----------------------------------------------------------------
+
+  const analyzeDriverMovementTool = new DynamicStructuredTool({
+    name: "analyze_driver_movement",
+    description:
+      "Analyze what a driver is currently doing based on their GPS movement and active orders. " +
+      "Returns a plain-English situation assessment: whether the driver is stationary or moving, " +
+      "whether they appear to be heading toward a restaurant pickup or customer delivery, " +
+      "if they are at (or very near) a restaurant or customer, or if they seem off-route. " +
+      "Also reports distance to each relevant order destination and how long since they last moved. " +
+      "Use this whenever you need to understand a driver's status — late delivery checks, " +
+      "stalled driver detection, pickup progress, etc.",
+    schema: z.object({
+      driverId: z
+        .string()
+        .describe("Driver ID (email address)"),
+    }).passthrough(),
+    func: async (input) => {
+      try {
+        const driver = store.getDriver(input.driverId);
+        if (!driver) {
+          return JSON.stringify({
+            error: "Driver not found in ontology",
+            driverId: input.driverId,
+          });
+        }
+
+        const snapshots = locationHistory.getHistory(input.driverId, 10);
+        const current = snapshots.length > 0
+          ? snapshots[snapshots.length - 1]
+          : null;
+
+        if (!current) {
+          return JSON.stringify({
+            driverId: input.driverId,
+            driverName: driver.name,
+            status: "no_location_data",
+            summary: "No GPS data available for this driver.",
+          });
+        }
+
+        // ---- Movement analysis ----
+        const movedRecently = locationHistory.hasMovedRecently(input.driverId, 3);
+        const distLast5 = locationHistory.distanceTraveled(input.driverId, 5);
+        const distLast10 = locationHistory.distanceTraveled(input.driverId, 10);
+
+        // Time since last significant movement (>50m between consecutive points)
+        let minutesSinceLastMove: number | null = null;
+        if (snapshots.length >= 2) {
+          for (let i = snapshots.length - 1; i > 0; i--) {
+            const d = haversineMeters(snapshots[i].location, snapshots[i - 1].location);
+            if (d > 50) {
+              minutesSinceLastMove = Math.round(
+                (Date.now() / 1000 - snapshots[i].timestamp) / 60,
+              );
+              break;
+            }
+          }
+          if (minutesSinceLastMove === null) {
+            // Never moved significantly in the window
+            minutesSinceLastMove = Math.round(
+              (Date.now() / 1000 - snapshots[0].timestamp) / 60,
+            );
+          }
+        }
+
+        // ---- Heading from last 2-3 points ----
+        let headingDegrees: number | null = null;
+        let headingCardinal: string | null = null;
+        if (snapshots.length >= 2) {
+          const prev = snapshots.length >= 3 ? snapshots[snapshots.length - 3] : snapshots[snapshots.length - 2];
+          headingDegrees = bearing(prev.location, current.location);
+          headingCardinal = degreesToCardinal(headingDegrees);
+        }
+
+        // ---- Active orders: distance + heading analysis ----
+        const activeOrders = store.queryOrders({ driverId: input.driverId })
+          .filter((o) => o.status !== "Completed" && o.status !== "Cancelled");
+
+        const orderAnalysis = activeOrders.map((order) => {
+          const restaurantLoc = order.orderLocation;
+          const customerLoc = order.customerLocation;
+
+          let distToRestaurant: number | null = null;
+          let distToCustomer: number | null = null;
+          let headingTowardRestaurant: boolean | null = null;
+          let headingTowardCustomer: boolean | null = null;
+          let atRestaurant = false;
+          let atCustomer = false;
+
+          if (restaurantLoc) {
+            distToRestaurant = Math.round(haversineMeters(current.location, restaurantLoc));
+            atRestaurant = distToRestaurant < 100; // within 100m
+            if (headingDegrees !== null) {
+              const bearingToRx = bearing(current.location, restaurantLoc);
+              headingTowardRestaurant = angleDiff(headingDegrees, bearingToRx) < 45;
+            }
+          }
+
+          if (customerLoc) {
+            distToCustomer = Math.round(haversineMeters(current.location, customerLoc));
+            atCustomer = distToCustomer < 100;
+            if (headingDegrees !== null) {
+              const bearingToCx = bearing(current.location, customerLoc);
+              headingTowardCustomer = angleDiff(headingDegrees, bearingToCx) < 45;
+            }
+          }
+
+          // Determine per-order situation
+          let orderSituation: string;
+          if (atRestaurant) {
+            orderSituation = "at_restaurant";
+          } else if (atCustomer) {
+            orderSituation = "at_customer";
+          } else if (!movedRecently) {
+            orderSituation = "stationary";
+          } else if (order.status === "InTransit" && headingTowardCustomer) {
+            orderSituation = "en_route_to_customer";
+          } else if (order.status === "InTransit" && !headingTowardCustomer) {
+            orderSituation = "moving_away_from_customer";
+          } else if ((order.status === "Ready" || order.status === "Confirmed") && headingTowardRestaurant) {
+            orderSituation = "heading_to_restaurant";
+          } else if ((order.status === "Ready" || order.status === "Confirmed") && !headingTowardRestaurant) {
+            orderSituation = "moving_away_from_restaurant";
+          } else {
+            orderSituation = "moving_unknown_intent";
+          }
+
+          return {
+            orderId: order.orderId,
+            orderIdKey: order.orderIdKey,
+            orderStatus: order.status,
+            restaurantName: order.restaurantName,
+            distToRestaurantMeters: distToRestaurant,
+            distToCustomerMeters: distToCustomer,
+            atRestaurant,
+            atCustomer,
+            headingTowardRestaurant,
+            headingTowardCustomer,
+            situation: orderSituation,
+          };
+        });
+
+        // ---- Build overall situation ----
+        let overallSituation: string;
+        if (!movedRecently && minutesSinceLastMove !== null && minutesSinceLastMove >= 3) {
+          overallSituation = "stalled";
+        } else if (!movedRecently) {
+          overallSituation = "stationary";
+        } else {
+          overallSituation = "moving";
+        }
+
+        // Build human-readable summary
+        const summaryParts: string[] = [];
+        summaryParts.push(
+          `${driver.name} (${driver.monacher ?? driver.driverId}) is ${overallSituation}.`,
+        );
+
+        if (distLast5 > 0) {
+          summaryParts.push(`Moved ${distLast5}m in last 5 min.`);
+        }
+        if (minutesSinceLastMove !== null && minutesSinceLastMove > 0) {
+          summaryParts.push(`Last significant movement ${minutesSinceLastMove} min ago.`);
+        }
+        if (headingCardinal && movedRecently) {
+          summaryParts.push(`Heading ${headingCardinal}.`);
+        }
+        for (const oa of orderAnalysis) {
+          const labels: Record<string, string> = {
+            at_restaurant: `At ${oa.restaurantName} (pickup).`,
+            at_customer: `At customer location for order ${oa.orderIdKey}.`,
+            en_route_to_customer: `Heading toward customer for ${oa.orderIdKey} (${oa.distToCustomerMeters}m away).`,
+            heading_to_restaurant: `Heading toward ${oa.restaurantName} for pickup (${oa.distToRestaurantMeters}m away).`,
+            moving_away_from_customer: `Moving but NOT toward customer for ${oa.orderIdKey} (${oa.distToCustomerMeters}m away).`,
+            moving_away_from_restaurant: `Moving but NOT toward ${oa.restaurantName} (${oa.distToRestaurantMeters}m away).`,
+            stationary: `Stationary — ${oa.distToRestaurantMeters}m from ${oa.restaurantName}, ${oa.distToCustomerMeters}m from customer.`,
+            moving_unknown_intent: `Moving (${headingCardinal}) but unclear destination.`,
+          };
+          summaryParts.push(labels[oa.situation] ?? oa.situation);
+        }
+
+        if (activeOrders.length === 0) {
+          summaryParts.push("No active orders assigned.");
+        }
+
+        return JSON.stringify({
+          driverId: input.driverId,
+          driverName: driver.name,
+          monacher: driver.monacher ?? null,
+          dispatchZone: driver.dispatchZone,
+          isOnline: driver.isOnline,
+          overallSituation,
+          heading: headingCardinal,
+          movedRecently,
+          distanceLast5MinMeters: distLast5,
+          distanceLast10MinMeters: distLast10,
+          minutesSinceLastMove,
+          activeOrderCount: activeOrders.length,
+          orders: orderAnalysis,
+          summary: summaryParts.join(" "),
+        });
+      } catch (err) {
+        log.error({ err, input }, "analyze_driver_movement failed");
+        return JSON.stringify({
+          error: "Failed to analyze driver movement",
+          details: String(err),
+        });
+      }
+    },
+  });
+
+  return [analyzeDriverMovementTool];
+}
+
+// ---------------------------------------------------------------------------
+// Geo helpers (used by location tools)
+// ---------------------------------------------------------------------------
+
+/** Calculate bearing in degrees from point A to point B. */
+function bearing(a: { latitude: number; longitude: number }, b: { latitude: number; longitude: number }): number {
+  const toRad = (d: number) => (d * Math.PI) / 180;
+  const toDeg = (r: number) => (r * 180) / Math.PI;
+
+  const dLon = toRad(b.longitude - a.longitude);
+  const lat1 = toRad(a.latitude);
+  const lat2 = toRad(b.latitude);
+
+  const y = Math.sin(dLon) * Math.cos(lat2);
+  const x = Math.cos(lat1) * Math.sin(lat2) - Math.sin(lat1) * Math.cos(lat2) * Math.cos(dLon);
+
+  return (toDeg(Math.atan2(y, x)) + 360) % 360;
+}
+
+/** Smallest angle between two bearings (0-180). */
+function angleDiff(a: number, b: number): number {
+  const d = Math.abs(a - b) % 360;
+  return d > 180 ? 360 - d : d;
+}
+
+/** Convert bearing degrees to a cardinal direction string. */
+function degreesToCardinal(deg: number): string {
+  const dirs = ["N", "NE", "E", "SE", "S", "SW", "W", "NW"];
+  return dirs[Math.round(deg / 45) % 8];
 }
 
 // ---------------------------------------------------------------------------
