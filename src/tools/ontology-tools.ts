@@ -661,7 +661,76 @@ export function createOntologyTools(
   });
 
   // ------------------------------------------------------------------
-  // 9. request_clarification — Pause and request help
+  // 9. get_driver_messages — Full message thread for a driver
+  // ------------------------------------------------------------------
+
+  const getDriverMessagesTool = new DynamicStructuredTool({
+    name: "get_driver_messages",
+    description:
+      "Get the recent message history for a specific driver — the full thread of messages " +
+      "between dispatch and the driver, with timestamps and direction (from driver vs to driver). " +
+      "Use this BEFORE sending a message to check what was already said, or after sending a message " +
+      "to see if the driver responded. Returns messages newest-first.",
+    schema: z.object({
+      driverId: z
+        .string()
+        .describe("Driver email address (e.g. 'john@example.com')"),
+      limit: z
+        .number()
+        .nullable().optional()
+        .describe("Max messages to return (default 15, max 50)"),
+    }).passthrough(),
+    func: async (input) => {
+      try {
+        const driverId = input.driverId;
+        const limit = Math.min(Math.max(input.limit ?? 15, 1), 50);
+        const driver = store.getDriver(driverId);
+        const driverName = driver?.name ?? driverId.split("@")[0];
+
+        // Query DynamoDB for message history
+        const dynamo = new DynamoDBClient({ region: process.env.AWS_REGION ?? "us-east-1" });
+        const result = await dynamo.send(
+          new QueryCommand({
+            TableName: "ValleyEats-DriverMessages",
+            KeyConditionExpression: "DriverId = :driverId",
+            ExpressionAttributeValues: { ":driverId": { S: driverId } },
+            ScanIndexForward: false, // newest first
+            Limit: limit,
+          }),
+        );
+
+        const messages = (result.Items ?? []).map((item) => {
+          const raw = unmarshall(item);
+          const colour = raw.Colour ?? "";
+          const isFromDriver = colour === "Undefined";
+          const ts = raw.ts ? new Date(Number(raw.ts) * 1000) : new Date();
+          return {
+            timestamp: ts.toISOString(),
+            direction: isFromDriver ? "FROM_DRIVER" : "TO_DRIVER",
+            author: raw.Author ?? "unknown",
+            message: raw.Message ?? "",
+            minutesAgo: Math.round((Date.now() - ts.getTime()) / 60_000),
+          };
+        });
+
+        return JSON.stringify({
+          driverId,
+          driverName,
+          messageCount: messages.length,
+          messages,
+        });
+      } catch (err) {
+        log.error({ err, input }, "get_driver_messages failed");
+        return JSON.stringify({
+          error: "Failed to fetch driver messages",
+          details: String(err),
+        });
+      }
+    },
+  });
+
+  // ------------------------------------------------------------------
+  // 10. request_clarification — Pause and request help
   // ------------------------------------------------------------------
 
   const requestClarificationTool = new DynamicStructuredTool({
@@ -933,6 +1002,7 @@ export function createOntologyTools(
     queryConversationsTool,
     getOrderDetailsTool,
     getTicketDetailsTool,
+    getDriverMessagesTool,
     queryDriverShiftsTool,
     getEntityTimelineTool,
     executeActionTool,
