@@ -45,6 +45,7 @@ export class OntologySyncer {
   private readonly log: Logger;
   private intervalHandle: ReturnType<typeof setInterval> | null = null;
   private _isSyncing = false;
+  private _hasDynamoConversations = false;
   private locationHistory: DriverLocationHistory | null = null;
 
   /**
@@ -447,7 +448,10 @@ export class OntologySyncer {
       this.store.updateOrders(orders);
       this.store.updateDrivers(drivers);
       this.store.updateMarkets(markets);
-      if (conversations.length > 0) {
+      // Only use dispatch.txt conversations as a fallback — if DynamoDB conversations
+      // have been synced via syncConversations(), those are authoritative (they have
+      // proper Colour/Opened fields for unread detection).
+      if (conversations.length > 0 && !this._hasDynamoConversations) {
         this.store.updateConversations(conversations);
       }
 
@@ -496,6 +500,22 @@ export class OntologySyncer {
   syncTickets(tickets: ReturnType<typeof transformTicket>[]): void {
     this.store.updateTickets(tickets);
     this.log.info({ count: tickets.length }, "Tickets synced into store");
+  }
+
+  /**
+   * Replace conversations from external DynamoDB data (ValleyEats-DriverLatestMessage).
+   * When called, this overrides any conversations extracted from dispatch.txt.
+   */
+  syncConversations(rawConversations: any[]): void {
+    const conversations = rawConversations
+      .map((raw) => {
+        try { return transformConversation(raw); }
+        catch { return null; }
+      })
+      .filter(Boolean) as ReturnType<typeof transformConversation>[];
+    this.store.updateConversations(conversations);
+    this._hasDynamoConversations = true;
+    this.log.info({ count: conversations.length }, "Conversations synced from DynamoDB");
   }
 
   // ---- Private helpers ------------------------------------------------------
@@ -608,23 +628,39 @@ export class OntologySyncer {
    * and the driver-to-order ratio.
    */
   private enrichMarketActiveOrders(): void {
-    const counts = new Map<string, number>();
+    const orderCounts = new Map<string, number>();
+    const driverCounts = new Map<string, number>();
 
     for (const order of this.store.orders.values()) {
       // Takeout orders are already excluded from the store at ingestion
       if (order.status !== "Completed" && order.status !== "Cancelled") {
-        counts.set(
+        orderCounts.set(
           order.deliveryZone,
-          (counts.get(order.deliveryZone) ?? 0) + 1,
+          (orderCounts.get(order.deliveryZone) ?? 0) + 1,
+        );
+      }
+    }
+
+    // Count actual on-shift drivers per zone — the Meter's `drivers` field
+    // only counts Available=true (on-call) and misses OnShift=true drivers.
+    for (const driver of this.store.drivers.values()) {
+      if (driver.isOnline && driver.dispatchZone) {
+        driverCounts.set(
+          driver.dispatchZone,
+          (driverCounts.get(driver.dispatchZone) ?? 0) + 1,
         );
       }
     }
 
     for (const market of this.store.markets.values()) {
-      const activeOrders = counts.get(market.market) ?? 0;
+      const activeOrders = orderCounts.get(market.market) ?? 0;
+      const actualDrivers = driverCounts.get(market.market) ?? 0;
+      // Use the higher of meter vs actual on-shift count
+      const availableDrivers = Math.max(market.availableDrivers, actualDrivers);
+      (market as any).availableDrivers = availableDrivers;
       (market as any).activeOrders = activeOrders;
       (market as any).driverToOrderRatio =
-        activeOrders > 0 ? market.availableDrivers / activeOrders : null;
+        activeOrders > 0 ? availableDrivers / activeOrders : null;
     }
   }
 
