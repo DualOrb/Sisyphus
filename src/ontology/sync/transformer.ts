@@ -246,6 +246,8 @@ export function transformDriver(raw: any): Driver {
       ? { latitude: num(raw.DriverLocation.latitude), longitude: num(raw.DriverLocation.longitude) }
       : null,
 
+    scheduleString: raw?.ScheduleString ? str(raw.ScheduleString) : undefined,
+
     // Computed
     status,
     isOnline,

@@ -85,6 +85,8 @@ export const DriverSchema = z.object({
   isOnline: z.boolean().describe("Computed: isAvailable && !isPaused && connectionId != null"),
   /** Number of currently active (non-completed/non-cancelled) orders */
   activeOrdersCount: z.number().int().describe("Computed: count from Orders table"),
+  /** Human-readable scheduled shift window, e.g. "9:00 AM - 4:00 PM" */
+  scheduleString: z.string().optional().describe("dispatch.txt: ScheduleString"),
 });
 
 export type Driver = z.infer<typeof DriverSchema>;
