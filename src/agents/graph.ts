@@ -448,7 +448,7 @@ function createCustomExecuteActionTool(
       "- AssignDriverToOrder: {orderId, driverId}\n" +
       "- ReassignOrder: {orderId, newDriverId, reason}\n" +
       "- SendDriverMessage: {driverId, message} (message max 500 chars)\n" +
-      "- FollowUpWithDriver: {driverId, message}\n" +
+      "- FollowUpWithDriver: {driverId, originalContext, followUpMessage}\n" +
       "- ResolveTicket: {ticketId, resolutionType: 'refund'|'credit'|'redelivery'|'apology'|'no_action', resolution: string (description), reason: string, refundAmount?: number (cents, required if resolutionType='refund')}\n" +
       "- EscalateTicket: {ticketId, reason}\n" +
       "- AddTicketNote: {ticketId, note}\n" +
