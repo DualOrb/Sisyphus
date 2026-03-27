@@ -9,6 +9,7 @@
  *                               -> __end__  (if no pending tasks)
  *   driver_comms     -> bridge -> supervisor
  *   customer_support -> bridge -> supervisor
+ *   task_executor    -> bridge -> supervisor
  *
  * The supervisor sets `pendingTasks` — an array of task assignments.
  * The conditional edge reads that array and emits one `Send` per task,
@@ -41,8 +42,13 @@ import {
   CUSTOMER_SUPPORT_NAME,
   CUSTOMER_SUPPORT_PREAMBLE,
 } from "./customer-support/agent.js";
-import { createOntologyTools } from "../tools/ontology-tools.js";
-import { createProcessTools } from "../tools/process-tools.js";
+import {
+  filterTaskExecutorTools,
+  TASK_EXECUTOR_NAME,
+  TASK_EXECUTOR_PREAMBLE,
+} from "./task-executor/agent.js";
+import { createOntologyTools, createLocationHistoryTools } from "../tools/ontology-tools.js";
+import { createProcessTools, initProcessRAG, buildProcessCatalog } from "../tools/process-tools.js";
 import {
   loadProcessDirectory,
   buildSystemPrompt,
@@ -54,6 +60,7 @@ import type { ExecutionContext, AuditRecord } from "../guardrails/types.js";
 import type { ShadowExecutor } from "../execution/shadow/executor.js";
 import type { ShadowMetrics } from "../execution/shadow/metrics.js";
 import type { OntologyStore } from "../ontology/state/index.js";
+import type { DriverLocationHistory } from "../ontology/state/location-history.js";
 import { acquireLock, releaseLock } from "../memory/redis/locks.js";
 import { recordAction } from "../memory/redis/action-timeline.js";
 import { guessEntityType, guessEntityId } from "../lib/entity-helpers.js";
@@ -177,6 +184,13 @@ export interface CreateDispatchGraphOptions {
    * Agents can still fetch additional procedures via lookup_process.
    */
   processSelectionContext?: ProcessSelectionContext;
+
+  /**
+   * Optional driver location history tracker. When provided, location
+   * tools (get_driver_location, get_driver_location_history,
+   * get_driver_distance_to) are added to the agent toolset.
+   */
+  locationHistory?: DriverLocationHistory;
 }
 
 /**
@@ -200,6 +214,7 @@ export async function createDispatchGraph(
     correlationId,
     processSelectionContext,
     onAgentActivity,
+    locationHistory,
   } = options;
 
   // -----------------------------------------------------------------------
@@ -211,40 +226,31 @@ export async function createDispatchGraph(
   log.info({ count: processes.length }, "Process files loaded");
 
   // -----------------------------------------------------------------------
-  // 1b. Build system prompts — use selectRelevantProcesses when a
-  //     context is provided (production), otherwise load ALL per agent.
+  // 1b. Initialize RAG vector store for semantic process lookup
   // -----------------------------------------------------------------------
 
-  let supervisorPrompt: string;
-  let driverCommsPrompt: string;
-  let customerSupportPrompt: string;
-
-  if (processSelectionContext) {
-    // Production path: lean per-agent prompts using selectRelevantProcesses.
-    // Agents can still fetch additional procedures via the lookup_process tool.
-    const supervisorBase = selectRelevantProcesses(processes, "supervisor", processSelectionContext);
-    const driverCommsBase = selectRelevantProcesses(processes, "driver-comms", processSelectionContext);
-    const customerSupportBase = selectRelevantProcesses(processes, "customer-support", processSelectionContext);
-
-    log.info(
-      {
-        supervisor: supervisorBase.length,
-        driverComms: driverCommsBase.length,
-        customerSupport: customerSupportBase.length,
-        totalLibrary: processes.length,
-      },
-      "Base process files selected per agent (full library available via lookup_process tool)",
-    );
-
-    supervisorPrompt = buildSystemPrompt("supervisor", supervisorBase);
-    driverCommsPrompt = buildSystemPrompt("driver-comms", driverCommsBase);
-    customerSupportPrompt = buildSystemPrompt("customer-support", customerSupportBase);
-  } else {
-    // Dev path: load all process files per agent (original behaviour).
-    supervisorPrompt = buildSystemPrompt("supervisor", processes);
-    driverCommsPrompt = buildSystemPrompt("driver-comms", processes);
-    customerSupportPrompt = buildSystemPrompt("customer-support", processes);
+  try {
+    await initProcessRAG(processes);
+    log.info("Process RAG initialized with local embeddings");
+  } catch (err) {
+    log.warn({ err }, "RAG initialization failed — falling back to keyword search");
   }
+
+  // -----------------------------------------------------------------------
+  // 1c. Build lean system prompts — global rules + process catalog only
+  // -----------------------------------------------------------------------
+
+  const globalRulesOnly = processes.filter(
+    (p) => p.agent === "all" && p.trigger === "system",
+  );
+  const catalog = buildProcessCatalog(processes);
+
+  // Each agent gets: AGENTS.md (~40 lines) + catalog (~30 lines) + preamble
+  // Total: ~1K tokens. Full procedures loaded on-demand via lookup_process.
+  const supervisorPrompt = buildSystemPrompt("supervisor", globalRulesOnly) + "\n\n" + catalog;
+  const driverCommsPrompt = buildSystemPrompt("driver-comms", globalRulesOnly) + "\n\n" + catalog;
+  const customerSupportPrompt = buildSystemPrompt("customer-support", globalRulesOnly) + "\n\n" + catalog;
+  const taskExecutorPrompt = buildSystemPrompt("task-executor", globalRulesOnly) + "\n\n" + catalog;
 
   // -----------------------------------------------------------------------
   // 2. Create ontology tools
@@ -276,13 +282,20 @@ export async function createDispatchGraph(
   const processTools = createProcessTools(processes);
   allTools.push(...processTools);
 
+  // Add location history tools if available
+  const locationTools = createLocationHistoryTools(locationHistory ?? null, store);
+  allTools.push(...locationTools);
+
   // -----------------------------------------------------------------------
   // 3. Create LLM instances
   // -----------------------------------------------------------------------
 
   const defaultModel = createChatModel();
-  // The supervisor may need more capable reasoning for triage decisions
-  const supervisorModel = createChatModel("escalation_decision");
+  // Supervisor uses the same primary model — its job is routing
+  // (reading the pre-built prompt and calling assign_tasks), not
+  // complex reasoning. Fallback model is only used when the primary
+  // is unreachable (handled by src/llm/client.ts).
+  const supervisorModel = defaultModel;
 
   // -----------------------------------------------------------------------
   // 4. Create agent nodes
@@ -311,6 +324,15 @@ export async function createDispatchGraph(
     systemPrompt: CUSTOMER_SUPPORT_PREAMBLE + "\n\n" + customerSupportPrompt,
     tools: filterCustomerSupportTools(allTools),
     model: defaultModel,
+    onActivity: onAgentActivity,
+  });
+
+  const taskExecutorNode = createAgentNode({
+    name: TASK_EXECUTOR_NAME,
+    systemPrompt: TASK_EXECUTOR_PREAMBLE + "\n\n" + taskExecutorPrompt,
+    tools: filterTaskExecutorTools(allTools),
+    model: defaultModel,
+    maxIterations: 5, // Task executor is a utility — fewer iterations than reasoning agents
     onActivity: onAgentActivity,
   });
 
@@ -346,6 +368,7 @@ export async function createDispatchGraph(
     .addNode("supervisor", supervisorNode)
     .addNode(DRIVER_COMMS_NAME, driverCommsNode)
     .addNode(CUSTOMER_SUPPORT_NAME, customerSupportNode)
+    .addNode(TASK_EXECUTOR_NAME, taskExecutorNode)
     .addNode("bridge", bridgeNode)
 
     // Entry point: every invocation starts at the supervisor
@@ -356,6 +379,7 @@ export async function createDispatchGraph(
     .addConditionalEdges("supervisor", supervisorRouter, [
       DRIVER_COMMS_NAME,
       CUSTOMER_SUPPORT_NAME,
+      TASK_EXECUTOR_NAME,
       END,
     ])
 
@@ -364,6 +388,7 @@ export async function createDispatchGraph(
     // conversations to end with a user message don't reject the request.
     .addEdge(DRIVER_COMMS_NAME, "bridge")
     .addEdge(CUSTOMER_SUPPORT_NAME, "bridge")
+    .addEdge(TASK_EXECUTOR_NAME, "bridge")
     .addEdge("bridge", "supervisor");
 
   // -----------------------------------------------------------------------
@@ -419,9 +444,16 @@ function createCustomExecuteActionTool(
       "executed according to its autonomy tier (GREEN/YELLOW auto-execute, ORANGE staged " +
       "for review, RED requires human approval). ALWAYS provide a clear reasoning string " +
       "explaining why you chose this action — it is logged to the audit trail.\n\n" +
-      "Available actions include: AssignDriverToOrder, ReassignOrder, UpdateOrderStatus, " +
-      "CancelOrder, SendDriverMessage, FollowUpWithDriver, ResolveTicket, EscalateTicket, " +
-      "AddTicketNote, FlagMarketIssue, and more.",
+      "Available actions and their key params:\n" +
+      "- AssignDriverToOrder: {orderId, driverId}\n" +
+      "- ReassignOrder: {orderId, newDriverId, reason}\n" +
+      "- SendDriverMessage: {driverId, message} (message max 500 chars)\n" +
+      "- FollowUpWithDriver: {driverId, message}\n" +
+      "- ResolveTicket: {ticketId, resolutionType: 'refund'|'credit'|'redelivery'|'apology'|'no_action', resolution: string (description), reason: string, refundAmount?: number (cents, required if resolutionType='refund')}\n" +
+      "- EscalateTicket: {ticketId, reason}\n" +
+      "- AddTicketNote: {ticketId, note}\n" +
+      "- FlagMarketIssue: {market, issueType: 'low_drivers'|'high_demand'|'high_eta'|'unassigned_orders', severity: 'low'|'medium'|'high'|'critical', details}\n" +
+      "- CancelOrder: {orderId, reason, cancellationOwner: 'ValleyEats'|'Restaurant'|'Driver'|'Customer'}",
     schema: z.object({
       actionName: z
         .string()
@@ -431,9 +463,13 @@ function createCustomExecuteActionTool(
         .describe("Action parameters as a JSON object (varies by action type)"),
       reasoning: z
         .string()
-        .describe("Your explanation of why you are taking this action. This is logged to the audit trail."),
-    }),
+        .nullable()
+        .optional()
+        .describe("Your explanation of why you are taking this action (logged to audit trail)."),
+    }).passthrough(),
     func: async (input) => {
+      // Default reasoning if not provided
+      const reasoning = input.reasoning ?? "No reasoning provided";
       // ------------------------------------------------------------------
       // Entity locking for parallel safety
       // ------------------------------------------------------------------
@@ -459,7 +495,7 @@ function createCustomExecuteActionTool(
             );
             return JSON.stringify({
               skipped: true,
-              reason: `Entity ${entityType}:${entityId} is being handled by ${holder}. Skipping to avoid conflict.`,
+              reason: `Entity ${entityType}:${entityId} is currently locked by ${holder}. Your action was NOT executed. Do NOT retry — include this in your summary so the supervisor can handle it on the next cycle.`,
             });
           }
 
@@ -520,7 +556,7 @@ function createCustomExecuteActionTool(
         const result = await executeAction(
           input.actionName,
           input.params,
-          input.reasoning,
+          reasoning,
           agentId,
           executionContext,
         );

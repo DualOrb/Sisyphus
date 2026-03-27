@@ -27,7 +27,6 @@ export {
   createSupervisorNode,
   AGENT_NAMES,
   assignTasksTool,
-  routeDecisionTool,
   type AgentName,
   type SupervisorConfig,
 } from "./supervisor/agent.js";
@@ -46,6 +45,13 @@ export {
   CUSTOMER_SUPPORT_NAME,
   type CustomerSupportConfig,
 } from "./customer-support/agent.js";
+
+export {
+  createTaskExecutorNode,
+  filterTaskExecutorTools,
+  TASK_EXECUTOR_NAME,
+  type TaskExecutorConfig,
+} from "./task-executor/agent.js";
 
 // Graph
 export {
