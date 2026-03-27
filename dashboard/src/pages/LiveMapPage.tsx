@@ -123,19 +123,19 @@ function SceneContent({
 // ---------------------------------------------------------------------------
 
 function CenterLogo() {
-  const texture = useMemo(() => new THREE.TextureLoader().load("https://valleyeats.ca/valley-eats-logo.png"), []);
+  const texture = useMemo(() => new THREE.TextureLoader().load("/valley-eats-logo.png"), []);
 
   return (
     <group position={[0, -195, 0]}>
-      {/* Logo flat on the ground plane */}
+      {/* Logo flat on the ground plane — big */}
       <mesh rotation={[-Math.PI / 2, 0, 0]}>
-        <circleGeometry args={[200, 64]} />
-        <meshBasicMaterial map={texture} transparent opacity={0.7} side={THREE.DoubleSide} depthWrite={false} />
+        <circleGeometry args={[800, 64]} />
+        <meshBasicMaterial map={texture} transparent opacity={0.6} side={THREE.DoubleSide} depthWrite={false} />
       </mesh>
-      {/* Subtle glow ring around logo */}
+      {/* Glow ring around logo */}
       <mesh rotation={[-Math.PI / 2, 0, 0]} position={[0, 0.5, 0]}>
-        <ringGeometry args={[200, 230, 64]} />
-        <meshBasicMaterial color="#79A763" transparent opacity={0.08} side={THREE.DoubleSide} depthWrite={false} />
+        <ringGeometry args={[800, 860, 64]} />
+        <meshBasicMaterial color="#79A763" transparent opacity={0.06} side={THREE.DoubleSide} depthWrite={false} />
       </mesh>
     </group>
   );
