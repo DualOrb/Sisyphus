@@ -175,6 +175,8 @@ export class OntologyStore {
     this.orders.clear();
     this.ordersByKey.clear();
     for (const order of orders) {
+      // Takeout orders don't need dispatch — exclude from the store entirely
+      if (order.orderType === "Takeout") continue;
       this.orders.set(order.orderId, order);
       if (order.orderIdKey) {
         this.ordersByKey.set(order.orderIdKey, order);
