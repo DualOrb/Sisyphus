@@ -545,7 +545,10 @@ function DetailPanel({ node, onClose }: { node: GraphNode; onClose: () => void }
             ))}
           </>}
           {/* Linked customer */}
-          {r.customerId && <ExpandableSection title="Customer" fetchFn={() => api.customer(r.customerId)} render={(c: any) => <>
+          {r.customerId && <ExpandableSection title="Customer" fetchFn={() => api.customer(r.customerId).catch(() => ({ email: r.customerId, _notSynced: true }))} render={(c: any) => c._notSynced ? <>
+            <R l="email" v={c.email} />
+            <p className="text-[9px] text-cyan-700/25 italic">full customer profile not synced</p>
+          </> : <>
             <R l="name" v={c.name} /><R l="email" v={c.email} /><R l="phone" v={c.phone} />
             <R l="perks points" v={c.perksPoints?.toString()} /><R l="total orders" v={c.totalOrders?.toString()} />
             <R l="app version" v={c.appVersion} />
@@ -583,7 +586,9 @@ function DetailPanel({ node, onClose }: { node: GraphNode; onClose: () => void }
             <R l="camera" v={r.appSettings.camera} /><R l="phone perm" v={r.appSettings.phone} />
           </>}
           {/* Linked conversation */}
-          {r.driverId && <ExpandableSection title="Conversation" fetchFn={() => api.conversation(r.driverId)} render={(c: any) => <>
+          {r.driverId && <ExpandableSection title="Conversation" fetchFn={() => api.conversation(r.driverId).catch(() => ({ _none: true }))} render={(c: any) => c._none ? <>
+            <p className="text-[9px] text-cyan-700/25 italic">no conversation history</p>
+          </> : <>
             <R l="last message" v={c.lastMessagePreview} />
             <R l="last author" v={c.lastAuthor} />
             <R l="from driver" v={c.lastMessageFromDriver ? "yes" : "no"} />
