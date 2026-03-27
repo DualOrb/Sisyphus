@@ -72,6 +72,18 @@ defineAction({
   sideEffects: ["notify_driver", "notify_customer_eta", "audit_log"],
   criteria: [
     {
+      name: "order_is_delivery",
+      check: (params, state) => {
+        const store = state as unknown as OntologyStore;
+        const order = store.getOrder(params.orderId as string);
+        if (!order) return { passed: false, message: "Order not found" };
+        if (order.orderType === "Takeout") {
+          return { passed: false, message: "Cannot assign a driver to a Takeout order — no delivery needed" };
+        }
+        return { passed: true };
+      },
+    },
+    {
       name: "order_exists",
       check: (params, state) => {
         const store = state as unknown as OntologyStore;
@@ -88,6 +100,21 @@ defineAction({
         if (!order) return { passed: false, message: "Order not found" };
         if (["Completed", "Cancelled"].includes(order.status)) {
           return { passed: false, message: `Order is ${order.status} — cannot assign` };
+        }
+        return { passed: true };
+      },
+    },
+    {
+      name: "order_not_already_assigned",
+      check: (params, state) => {
+        const store = state as unknown as OntologyStore;
+        const order = store.getOrder(params.orderId as string);
+        if (!order) return { passed: false, message: "Order not found" };
+        if (order.driverId && order.driverId !== (params.driverId as string)) {
+          return {
+            passed: false,
+            message: `Order already assigned to driver ${order.driverId} — use ReassignOrder instead if reassignment is needed`,
+          };
         }
         return { passed: true };
       },
@@ -130,6 +157,18 @@ defineAction({
   sideEffects: ["notify_old_driver", "notify_new_driver", "update_customer_eta", "audit_log"],
   criteria: [
     {
+      name: "order_is_delivery",
+      check: (params, state) => {
+        const store = state as unknown as OntologyStore;
+        const order = store.getOrder(params.orderId as string);
+        if (!order) return { passed: false, message: "Order not found" };
+        if (order.orderType === "Takeout") {
+          return { passed: false, message: "Cannot assign a driver to a Takeout order — no delivery needed" };
+        }
+        return { passed: true };
+      },
+    },
+    {
       name: "order_has_current_driver",
       check: (params, state) => {
         const store = state as unknown as OntologyStore;
@@ -154,6 +193,28 @@ defineAction({
             passed: false,
             message: `Order is ${order.status} — cannot reassign (food is with driver or already terminal)`,
           };
+        }
+        // Also block if driver is actively working on the order (en-route or at restaurant)
+        // even if the top-level status still says "Confirmed".
+        // These timestamps come from StatusHistory in dispatch.txt.
+        if (order.enrouteAt || order.inBagAt) {
+          return {
+            passed: false,
+            message: `Driver is already ${order.inBagAt ? "in possession of food (InBag)" : "en route to restaurant"} — cannot reassign an order the driver is actively working on`,
+          };
+        }
+        return { passed: true };
+      },
+    },
+    {
+      name: "not_same_driver",
+      check: (params, state) => {
+        const store = state as unknown as OntologyStore;
+        const order = store.getOrder(params.orderId as string);
+        if (!order) return { passed: false, message: "Order not found" };
+        const newDriver = store.getDriver(params.newDriverId as string);
+        if (newDriver && order.driverId === newDriver.driverId) {
+          return { passed: false, message: "New driver is the same as current driver — no reassignment needed" };
         }
         return { passed: true };
       },
