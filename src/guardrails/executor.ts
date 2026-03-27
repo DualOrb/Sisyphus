@@ -185,7 +185,7 @@ async function _executeAction(
             cooldownResult.lastActionBy
               ? ` Last action by "${cooldownResult.lastActionBy}".`
               : ""
-          }`.trim(),
+          } Do NOT retry this action — move on to other work or note this in your summary for the supervisor.`.trim(),
         };
       }
     }
