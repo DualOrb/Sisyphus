@@ -18,6 +18,8 @@
  * @see planning/03-agent-design.md section 2
  */
 
+import { readFileSync } from "node:fs";
+import { resolve } from "node:path";
 import { ChatOpenAI } from "@langchain/openai";
 import {
   AIMessage,
@@ -30,6 +32,12 @@ import type { Redis as RedisClient } from "ioredis";
 import type { AgentStateType, AgentStateUpdate } from "./state.js";
 import { sendHeartbeat } from "../memory/redis/heartbeat.js";
 import { createChildLogger } from "../lib/index.js";
+
+/** Task directive loaded from markdown — shared instructions for all sub-agents. */
+const TASK_DIRECTIVE = readFileSync(
+  resolve(new URL(".", import.meta.url).pathname, "task-directive.md"),
+  "utf-8",
+);
 
 const log = createChildLogger("create-agent");
 
@@ -112,23 +120,7 @@ export function createAgentNode(
     if (state.currentTask) {
       preambleMessages.push(
         new SystemMessage(
-          `## YOUR ASSIGNED TASK\n\n` +
-          `${state.currentTask}\n\n` +
-          `## INSTRUCTIONS\n\n` +
-          `**Prefer the data in your task description above.** Only call query tools (query_orders, query_drivers, etc.) if your task is missing specific IDs or details needed to take action.\n\n` +
-          `**NEVER FABRICATE IDs.** If an order ID, ticket ID, or driver email is not in your task description, use the appropriate query tool to find it. Do NOT guess, invent, or construct IDs from entity names (e.g., "order_id_of_active_order_for_Alex_Quinton" is NOT a valid ID — you must query for the real one).\n\n` +
-          `### BEFORE YOU ACT — CHECK THE TIMELINE\n` +
-          `Call get_entity_timeline for EACH driver or order in your task BEFORE sending messages or taking actions. The timeline shows what was already done and when. Use it to decide:\n` +
-          `- Was this driver already messaged recently? If <5 min ago, do NOT re-message.\n` +
-          `- Was this order already assigned? If yes, don't re-assign.\n` +
-          `- Is there a cooldown active? If so, skip and note it.\n\n` +
-          `### Tools\n` +
-          `- get_entity_timeline — call this FIRST for every entity\n` +
-          `- execute_action — to take actions (SendDriverMessage, ResolveTicket, etc.)\n` +
-          `- query_orders / query_drivers — ONLY if your task is missing an ID you need\n` +
-          `- get_ticket_details / get_order_details — for detailed info not in your task\n` +
-          `- lookup_process — if you need a specific procedure\n\n` +
-          `**If an action returns cooldown_blocked or skipped, do NOT retry it.** Note it in your summary and move on.`,
+          `## YOUR ASSIGNED TASK\n\n${state.currentTask}\n\n${TASK_DIRECTIVE}`,
         ),
       );
     }

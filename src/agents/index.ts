@@ -31,27 +31,10 @@ export {
   type SupervisorConfig,
 } from "./supervisor/agent.js";
 
-// Sub-agents
-export {
-  createDriverCommsNode,
-  filterDriverCommsTools,
-  DRIVER_COMMS_NAME,
-  type DriverCommsConfig,
-} from "./driver-comms/agent.js";
-
-export {
-  createCustomerSupportNode,
-  filterCustomerSupportTools,
-  CUSTOMER_SUPPORT_NAME,
-  type CustomerSupportConfig,
-} from "./customer-support/agent.js";
-
-export {
-  createTaskExecutorNode,
-  filterTaskExecutorTools,
-  TASK_EXECUTOR_NAME,
-  type TaskExecutorConfig,
-} from "./task-executor/agent.js";
+// Sub-agents — names, preambles, and tool filters
+export { filterDriverCommsTools, DRIVER_COMMS_NAME, DRIVER_COMMS_PREAMBLE } from "./driver-comms/agent.js";
+export { filterCustomerSupportTools, CUSTOMER_SUPPORT_NAME, CUSTOMER_SUPPORT_PREAMBLE } from "./customer-support/agent.js";
+export { filterTaskExecutorTools, TASK_EXECUTOR_NAME, TASK_EXECUTOR_PREAMBLE } from "./task-executor/agent.js";
 
 // Graph
 export {
