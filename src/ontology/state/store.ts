@@ -174,9 +174,18 @@ export class OntologyStore {
   updateOrders(orders: Order[]): void {
     this.orders.clear();
     this.ordersByKey.clear();
+    const oneHourFromNow = new Date(Date.now() + 60 * 60 * 1000);
     for (const order of orders) {
       // Takeout orders don't need dispatch — exclude from the store entirely
       if (order.orderType === "Takeout") continue;
+      // Orders not ready within the next hour are not actionable — hide from the AI
+      if (order.readyAt && order.readyAt > oneHourFromNow) continue;
+      // Unassigned orders placed/confirmed less than 2 minutes ago don't need AI attention —
+      // the router will assign a driver automatically. Hide until the grace period expires.
+      if (!order.driverId) {
+        const confirmedMs = (order.confirmedAt ?? order.placedAt).getTime();
+        if (Date.now() - confirmedMs < 60 * 1000) continue;
+      }
       this.orders.set(order.orderId, order);
       if (order.orderIdKey) {
         this.ordersByKey.set(order.orderIdKey, order);
