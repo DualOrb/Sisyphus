@@ -4,6 +4,7 @@ import {
   shiftSummary,
   entityInteractions,
   type AuditLogRecord,
+  type AuditLogRow,
   type ShiftSummaryRecord,
   type EntityInteractionRow,
   type ShiftSummaryRow,
@@ -73,6 +74,24 @@ export async function writeAuditRecord(
   record: AuditLogRecord,
 ): Promise<void> {
   await db.insert(auditLog).values(record);
+}
+
+/**
+ * Fetch recent audit log records for the dashboard.
+ *
+ * @param db    - Drizzle instance
+ * @param limit - max rows to return (default 200, max 500)
+ * @returns Recent audit records, newest first
+ */
+export async function getRecentAuditRecords(
+  db: PostgresDb,
+  limit = 200,
+): Promise<AuditLogRow[]> {
+  return db
+    .select()
+    .from(auditLog)
+    .orderBy(desc(auditLog.timestamp))
+    .limit(Math.min(limit, 500));
 }
 
 /**
