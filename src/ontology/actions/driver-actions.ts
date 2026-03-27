@@ -40,7 +40,7 @@ defineAction({
   description: "Send a message to a driver in their conversation",
   tier: Tier.YELLOW,
   paramsSchema: SendDriverMessageParams,
-  cooldown: { entity: "driver", action: "message", ttlSeconds: 300 },
+  cooldown: { entity: "driver", action: "message", ttlSeconds: 120 },
   execution: "browser",
   sideEffects: ["deliver_message", "audit_log"],
   criteria: [
