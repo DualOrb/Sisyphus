@@ -560,6 +560,7 @@ export class OntologySyncer {
     const counts = new Map<string, number>();
 
     for (const order of this.store.orders.values()) {
+      // Takeout orders are already excluded from the store at ingestion
       if (order.status !== "Completed" && order.status !== "Cancelled") {
         counts.set(
           order.deliveryZone,
