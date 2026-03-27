@@ -115,13 +115,20 @@ export function createAgentNode(
           `## YOUR ASSIGNED TASK\n\n` +
           `${state.currentTask}\n\n` +
           `## INSTRUCTIONS\n\n` +
-          `The task above already contains all the data you need (order IDs, driver names, statuses, ready times, market info). ` +
-          `DO NOT call query_orders, query_drivers, query_restaurants, or query_tickets to re-read this data — it is already provided above.\n\n` +
-          `Only use tools for ACTIONS:\n` +
-          `- execute_action (SendDriverMessage, AddTicketNote, FlagMarketIssue, etc.)\n` +
-          `- get_ticket_details or get_order_details ONLY if you need info not in the task\n` +
-          `- lookup_process if you need a specific procedure\n\n` +
-          `Complete your task quickly: analyze the data, take action(s), then provide a brief summary. Do not investigate — act.`,
+          `**Prefer the data in your task description above.** Only call query tools (query_orders, query_drivers, etc.) if your task is missing specific IDs or details needed to take action.\n\n` +
+          `**NEVER FABRICATE IDs.** If an order ID, ticket ID, or driver email is not in your task description, use the appropriate query tool to find it. Do NOT guess, invent, or construct IDs from entity names (e.g., "order_id_of_active_order_for_Alex_Quinton" is NOT a valid ID — you must query for the real one).\n\n` +
+          `### BEFORE YOU ACT — CHECK THE TIMELINE\n` +
+          `Call get_entity_timeline for EACH driver or order in your task BEFORE sending messages or taking actions. The timeline shows what was already done and when. Use it to decide:\n` +
+          `- Was this driver already messaged recently? If <5 min ago, do NOT re-message.\n` +
+          `- Was this order already assigned? If yes, don't re-assign.\n` +
+          `- Is there a cooldown active? If so, skip and note it.\n\n` +
+          `### Tools\n` +
+          `- get_entity_timeline — call this FIRST for every entity\n` +
+          `- execute_action — to take actions (SendDriverMessage, ResolveTicket, etc.)\n` +
+          `- query_orders / query_drivers — ONLY if your task is missing an ID you need\n` +
+          `- get_ticket_details / get_order_details — for detailed info not in your task\n` +
+          `- lookup_process — if you need a specific procedure\n\n` +
+          `**If an action returns cooldown_blocked or skipped, do NOT retry it.** Note it in your summary and move on.`,
         ),
       );
     }
@@ -205,8 +212,9 @@ export function createAgentNode(
         const cachedResult = toolCallCache.get(cacheKey);
 
         if (cachedResult !== undefined) {
-          content = cachedResult;
-          log.debug({ agent: name, toolName: tc.name }, "Cached tool result for %s", tc.name);
+          // Tell the LLM this is a repeat call with the same result — stop retrying
+          content = cachedResult + "\n[NOTE: This is the same result as a previous identical call. Do NOT retry the same query — try different parameters or move on.]";
+          log.debug({ agent: name, toolName: tc.name }, "Cached tool result for %s (repeat call)", tc.name);
         } else if (tool) {
           try {
             const result = await (tool as any).invoke(tc.args);
@@ -240,7 +248,25 @@ export function createAgentNode(
       }
 
       newMessages.push(...toolResponses);
-      currentMessages = [...currentMessages, response, ...toolResponses];
+
+      // Detect cooldown/skip blocks and inject a hard stop to prevent retries
+      const hasBlock = toolResponses.some((tr) => {
+        const content = typeof (tr as any).content === "string" ? (tr as any).content : "";
+        return content.includes('"cooldown_blocked"') ||
+               content.includes('"skipped":true') ||
+               content.includes('"outcome":"cooldown_blocked"');
+      });
+
+      if (hasBlock) {
+        const stopMsg = new SystemMessage(
+          "[SYSTEM] One or more of your actions was BLOCKED by a cooldown or entity lock. " +
+          "Do NOT retry blocked actions. Move on to any remaining unblocked work, or if all work is blocked, " +
+          "provide your summary now. List the blocked actions in your summary.",
+        );
+        currentMessages = [...currentMessages, response, ...toolResponses, stopMsg];
+      } else {
+        currentMessages = [...currentMessages, response, ...toolResponses];
+      }
     }
 
     if (iterations >= maxIterations) {
