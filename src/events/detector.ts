@@ -19,12 +19,27 @@ import { PRIORITY_WEIGHT } from "./types.js";
 
 export class EventDetector {
   /**
+   * Dedup map for recurring events — prevents the same market alert or
+   * unassigned order from firing every 20-second poll. Key = event identity
+   * string, value = timestamp when first detected. Entries expire after 5 min.
+   */
+  private readonly recentEvents = new Map<string, number>();
+  private static readonly EVENT_DEDUP_TTL_MS = 5 * 60_000;
+
+  /**
    * Scan the ontology store and return events for every actionable condition.
    *
    * @param store          Current ontology state.
    * @param previousStore  Optional previous snapshot for diff-based detection.
    */
   detect(store: OntologyStore, previousStore?: OntologyStore): PrioritizedEvent[] {
+    // Expire old dedup entries
+    const nowMs = Date.now();
+    for (const [key, ts] of this.recentEvents) {
+      if (nowMs - ts > EventDetector.EVENT_DEDUP_TTL_MS) {
+        this.recentEvents.delete(key);
+      }
+    }
     const events: PrioritizedEvent[] = [];
     const now = new Date();
 
@@ -98,17 +113,25 @@ export class EventDetector {
 
       // Only flag if there are active orders with insufficient drivers
       if (market.availableDrivers === 0 && market.activeOrders > 0) {
-        events.push({
-          event: this.buildMarketAlertEvent(market, "critical"),
-          priority: "high",
-          createdAt: now,
-        });
+        const key = `market:${market.market}:critical`;
+        if (!this.recentEvents.has(key)) {
+          this.recentEvents.set(key, Date.now());
+          events.push({
+            event: this.buildMarketAlertEvent(market, "critical"),
+            priority: "high",
+            createdAt: now,
+          });
+        }
       } else if (market.score > 60 && market.availableDrivers > 0) {
-        events.push({
-          event: this.buildMarketAlertEvent(market, "warning"),
-          priority: "normal",
-          createdAt: now,
-        });
+        const key = `market:${market.market}:warning`;
+        if (!this.recentEvents.has(key)) {
+          this.recentEvents.set(key, Date.now());
+          events.push({
+            event: this.buildMarketAlertEvent(market, "warning"),
+            priority: "normal",
+            createdAt: now,
+          });
+        }
       }
     }
   }
