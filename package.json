@@ -17,7 +17,10 @@
     "typecheck": "tsc --noEmit",
     "db:generate": "drizzle-kit generate",
     "db:migrate": "drizzle-kit migrate",
-    "db:studio": "drizzle-kit studio"
+    "db:studio": "drizzle-kit studio",
+    "dashboard:install": "cd dashboard && npm install",
+    "dashboard:dev": "cd dashboard && npm run dev",
+    "dashboard:build": "cd dashboard && npm run build"
   },
   "dependencies": {
     "@aws-sdk/client-dynamodb": "^3.1017.0",
@@ -40,6 +43,7 @@
     "drizzle-orm": "^0.38.0",
     "gray-matter": "^4.0.3",
     "ioredis": "^5.4.0",
+    "langchain": "^1.2.37",
     "mysql2": "^3.12.0",
     "openai": "^4.77.0",
     "pg": "^8.13.0",
