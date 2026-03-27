@@ -125,11 +125,14 @@ export class DriverLocationHistory {
 
       for (const d of drivers) {
         if (d?.DriverLocation?.latitude != null) {
+          const lat = Number(d.DriverLocation.latitude);
+          const lng = Number(d.DriverLocation.longitude);
+          if (!Number.isFinite(lat) || !Number.isFinite(lng)) continue;
           this.record(
             d.DriverId,
             {
-              latitude: Number(d.DriverLocation.latitude),
-              longitude: Number(d.DriverLocation.longitude),
+              latitude: lat,
+              longitude: lng,
             },
             timestamp,
           );
