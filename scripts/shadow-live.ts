@@ -169,6 +169,108 @@ async function fetchDriverConversations(): Promise<any[]> {
 }
 
 // ---------------------------------------------------------------------------
+// Per-cycle agent log writer
+// ---------------------------------------------------------------------------
+
+function writeCycleAgentLogs(
+  cycleDir: string,
+  activity: { agent: string; type: string; iteration: number; content: string; ts: string }[],
+): void {
+  // Split activity into per-invocation runs.
+  // Each "invoked" entry starts a new invocation for that agent.
+  type Invocation = { agent: string; task: string; entries: typeof activity };
+  const invocations: Invocation[] = [];
+  const agentCounts = new Map<string, number>();
+
+  for (const entry of activity) {
+    if (entry.type === "invoked") {
+      const count = (agentCounts.get(entry.agent) ?? 0) + 1;
+      agentCounts.set(entry.agent, count);
+      invocations.push({ agent: entry.agent, task: entry.content, entries: [] });
+    } else {
+      // Find the last invocation for this agent
+      for (let i = invocations.length - 1; i >= 0; i--) {
+        if (invocations[i].agent === entry.agent) {
+          invocations[i].entries.push(entry);
+          break;
+        }
+      }
+    }
+  }
+
+  // Track how many of each agent we've written (for numbered dirs)
+  const writtenCounts = new Map<string, number>();
+
+  for (const inv of invocations) {
+    const n = (writtenCounts.get(inv.agent) ?? 0) + 1;
+    writtenCounts.set(inv.agent, n);
+    const total = agentCounts.get(inv.agent) ?? 1;
+
+    // Only number the dir if there are multiple invocations of the same agent
+    const dirName = total > 1
+      ? `${inv.agent.replace(/_/g, "-")}-${n}`
+      : inv.agent.replace(/_/g, "-");
+    const agentDir = resolve(cycleDir, dirName);
+    mkdirSync(agentDir, { recursive: true });
+
+    // Write prompt.md with the task assignment
+    if (inv.task) {
+      writeFileSync(resolve(agentDir, "prompt.md"), `# Task Assignment\n\n${inv.task}\n`);
+    }
+
+    // Write log.md with all activity
+    const lines: string[] = [`# ${inv.agent} — Activity Log\n`];
+    if (inv.task) {
+      lines.push(`> **Task:** ${inv.task.slice(0, 200)}${inv.task.length > 200 ? "..." : ""}\n`);
+    }
+
+    for (const e of inv.entries) {
+      if (e.type === "tool_call") {
+        const match = e.content.match(/^(\w+)\((.+)\)$/s);
+        if (match) {
+          const [, toolName, argsStr] = match;
+          try {
+            const args = JSON.parse(argsStr);
+            lines.push(`## [${e.ts}] Tool Call: ${toolName}`);
+            lines.push("```json");
+            lines.push(JSON.stringify(args, null, 2));
+            lines.push("```\n");
+          } catch {
+            lines.push(`## [${e.ts}] Tool Call: ${toolName}`);
+            lines.push(`\`${argsStr.slice(0, 200)}\`\n`);
+          }
+        } else {
+          lines.push(`## [${e.ts}] ${e.content.slice(0, 200)}\n`);
+        }
+      } else if (e.type === "tool_result") {
+        const arrow = e.content.indexOf(" → ");
+        if (arrow > 0) {
+          const toolName = e.content.slice(0, arrow);
+          const resultStr = e.content.slice(arrow + 3);
+          lines.push(`### Result: ${toolName}`);
+          try {
+            const parsed = JSON.parse(resultStr);
+            lines.push("```json");
+            lines.push(JSON.stringify(parsed, null, 2));
+            lines.push("```\n");
+          } catch {
+            lines.push(`\`\`\`\n${resultStr.slice(0, 500)}\n\`\`\`\n`);
+          }
+        } else {
+          lines.push(`### Result\n\`${e.content.slice(0, 300)}\`\n`);
+        }
+      } else if (e.type === "response" || e.type === "summary") {
+        lines.push(`## [${e.ts}] Final Response\n`);
+        lines.push(e.content);
+        lines.push("");
+      }
+    }
+
+    writeFileSync(resolve(agentDir, "log.md"), lines.join("\n"));
+  }
+}
+
+// ---------------------------------------------------------------------------
 // Main
 // ---------------------------------------------------------------------------
 
@@ -274,6 +376,9 @@ async function main() {
     onAgentActivity: (entry) => {
       const ts = now();
       const prefix = `[${ts}] [${entry.agent}]`;
+
+      // Collect for per-cycle agent logs
+      cycleActivity.push({ agent: entry.agent, type: entry.type, iteration: entry.iteration, content: entry.content, ts });
 
       // --- Extract entity IDs from content for dashboard highlighting ---
       const driverMatch = entry.content.match(/"driverId":"([^"]+)"/);
@@ -461,11 +566,16 @@ async function main() {
     }
   };
 
+  // Per-cycle activity log for agent debugging
+  type ActivityEntry = { agent: string; type: string; iteration: number; content: string; ts: string };
+  let cycleActivity: ActivityEntry[] = [];
+
   // Slow graph — invoked after each sync, but only if the previous run is done
   const runCycle = async () => {
     if (graphRunning || !latestDispatchData) return;
     graphRunning = true;
     cycleCount++;
+    cycleActivity = [];
 
     try {
       const result = await dispatchCycle.run(latestDispatchData);
@@ -484,6 +594,17 @@ async function main() {
         const duration = ((result.duration ?? 0) / 1000).toFixed(1);
         logBoth(`\n  \x1b[32m[${now()}] ── Cycle #${cycleCount} done (${duration}s) ── ${result.reason} | ${result.changesDetected} changes\x1b[0m`);
         logFile(`\n── Cycle #${cycleCount} [${now()}] (${duration}s) ── ${result.reason} | ${result.changesDetected} changes\n`);
+
+        // Write per-cycle debug files
+        const cycleDir = resolve("reports", "cycles", `cycle-${cycleCount}`);
+        mkdirSync(cycleDir, { recursive: true });
+
+        if (result.prompt) {
+          writeFileSync(resolve(cycleDir, "prompt.md"), result.prompt);
+        }
+
+        // Write per-agent activity logs
+        writeCycleAgentLogs(cycleDir, cycleActivity);
       } else if (result.changesDetected > 0) {
         logBoth(`  [${now()}] ${result.changesDetected} changes (cooldown)`);
       } else {
