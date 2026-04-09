@@ -48,7 +48,7 @@ const log = createChildLogger("create-agent");
 /** Callback for agent activity visibility. */
 export type AgentActivityCallback = (entry: {
   agent: string;
-  type: "tool_call" | "tool_result" | "response" | "summary";
+  type: "invoked" | "tool_call" | "tool_result" | "response" | "summary";
   iteration: number;
   content: string;
 }) => void;
@@ -101,6 +101,7 @@ export function createAgentNode(
 
   return async (state: AgentStateType): Promise<AgentStateUpdate> => {
     log.info({ agent: name, task: state.currentTask, taskType: state.currentTaskType }, "Agent invoked");
+    onActivity?.({ agent: name, type: "invoked", iteration: 0, content: state.currentTask ?? "" });
 
     // Send initial heartbeat
     if (redis) {

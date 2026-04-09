@@ -129,6 +129,7 @@ export function createSupervisorNode(
 
   return async (state: AgentStateType): Promise<AgentStateUpdate> => {
     log.info("Supervisor invoked");
+    onActivity?.({ agent: "supervisor", type: "invoked", iteration: 0, content: "" });
 
     // If a sub-agent flagged escalation, include that context
     let escalationContext = "";
