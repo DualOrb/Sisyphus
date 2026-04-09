@@ -54,6 +54,8 @@ export interface CycleResult {
   changesDetected: number;
   reason: "initial" | "changes" | "heartbeat" | "skipped";
   summary?: string;
+  /** Full prompt sent to the supervisor (for debugging/tuning). */
+  prompt?: string;
 }
 
 // ---------------------------------------------------------------------------
@@ -286,6 +288,7 @@ export class DispatchCycle {
       changesDetected: changes.details.length,
       reason,
       summary,
+      prompt: combinedPrompt,
     };
   }
 
